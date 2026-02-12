@@ -64,7 +64,6 @@ impl QueryMode {
                 &["Use one of: auto, text, symbol"],
                 None,
                 None,
-                None,
             )),
         }
     }
@@ -80,17 +79,6 @@ pub enum Phase {
 }
 
 impl Phase {
-    #[cfg(test)]
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Metadata => "metadata",
-            Self::Check => "check",
-            Self::Indexing => "indexing",
-            Self::Ready => "ready",
-            Self::Failed(_) => "failed",
-        }
-    }
-
     fn status(&self) -> &'static str {
         match self {
             Self::Metadata | Self::Check => "queued",
@@ -99,6 +87,16 @@ impl Phase {
             Self::Failed(_) => "failed",
         }
     }
+}
+
+pub struct SearchDocsRequest<'a> {
+    pub project_path: Option<&'a Path>,
+    pub query: String,
+    pub filter_crates: Option<Vec<String>>,
+    pub filter_kinds: Option<Vec<String>>,
+    pub mode: QueryMode,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -237,7 +235,6 @@ pub fn tool_error_payload(
     retryable: bool,
     hints: &[&str],
     project_path: Option<&Path>,
-    crate_name: Option<&str>,
     debug_raw: Option<&str>,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
@@ -256,9 +253,6 @@ pub fn tool_error_payload(
             serde_json::json!(path.display().to_string()),
         );
     }
-    if let Some(name) = crate_name {
-        obj.insert("crate".to_string(), serde_json::json!(name));
-    }
     if let Some(raw) = debug_raw {
         obj.insert("debug".to_string(), serde_json::json!({ "raw": raw }));
     }
@@ -272,7 +266,6 @@ fn invalid_tool_error(
     retryable: bool,
     hints: &[&str],
     project_path: Option<&Path>,
-    crate_name: Option<&str>,
     debug_raw: Option<&str>,
 ) -> McpError {
     McpError::invalid_params(
@@ -284,7 +277,6 @@ fn invalid_tool_error(
             retryable,
             hints,
             project_path,
-            crate_name,
             debug_raw,
         )),
     )
@@ -297,7 +289,6 @@ fn internal_tool_error(
     retryable: bool,
     hints: &[&str],
     project_path: Option<&Path>,
-    crate_name: Option<&str>,
     debug_raw: Option<&str>,
 ) -> McpError {
     McpError::internal_error(
@@ -309,7 +300,6 @@ fn internal_tool_error(
             retryable,
             hints,
             project_path,
-            crate_name,
             debug_raw,
         )),
     )
@@ -374,7 +364,6 @@ fn build_fts_query(query: &str, mode: QueryMode) -> Result<String, McpError> {
             &["Provide at least one search term"],
             None,
             None,
-            None,
         ));
     }
 
@@ -395,7 +384,6 @@ fn build_fts_query(query: &str, mode: QueryMode) -> Result<String, McpError> {
             "search_docs",
             false,
             &["Use words or symbols like tokio::spawn"],
-            None,
             None,
             None,
         ));
@@ -436,7 +424,6 @@ fn normalize_tool_error(section_raw: &serde_json::Value, stage: &str) -> Option<
         stage,
         true,
         &[],
-        None,
         None,
         None,
     ))
@@ -493,7 +480,6 @@ impl AppState {
                 &["Call register_project first"],
                 Some(&canonical),
                 None,
-                None,
             )
         })
     }
@@ -512,7 +498,6 @@ impl AppState {
                     false,
                     &["Ensure the project has a valid Cargo workspace"],
                     Some(canonical),
-                    None,
                     Some(&e.to_string()),
                 )
             })?;
@@ -524,7 +509,6 @@ impl AppState {
                 false,
                 &[],
                 Some(canonical),
-                None,
                 Some(&e.to_string()),
             )
         })?;
@@ -550,7 +534,6 @@ impl AppState {
                     true,
                     &["Retry the request"],
                     Some(canonical),
-                    None,
                     Some(&e.to_string()),
                 )
             })?;
@@ -723,7 +706,6 @@ impl AppState {
                 &[],
                 Some(&canonical),
                 None,
-                None,
             ));
         }
 
@@ -750,7 +732,6 @@ impl AppState {
                     "register_project",
                     false,
                     &["Unregister a project before adding another"],
-                    None,
                     None,
                     None,
                 ));
@@ -789,7 +770,6 @@ impl AppState {
                 &[],
                 Some(&canonical),
                 None,
-                None,
             ));
         }
 
@@ -806,7 +786,6 @@ impl AppState {
                         false,
                         &["Call register_project first"],
                         Some(&canonical),
-                        None,
                         None,
                     ));
                 }
@@ -989,7 +968,6 @@ impl AppState {
                 true,
                 &["Run cargo check locally for complete output"],
                 Some(project_path),
-                None,
                 Some(message),
             );
         }
@@ -1044,14 +1022,17 @@ impl AppState {
 
     pub async fn search_docs(
         &self,
-        project_path: Option<&Path>,
-        query: String,
-        filter_crates: Option<Vec<String>>,
-        filter_kinds: Option<Vec<String>>,
-        mode: QueryMode,
-        limit: usize,
-        offset: usize,
+        request: SearchDocsRequest<'_>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let SearchDocsRequest {
+            project_path,
+            query,
+            filter_crates,
+            filter_kinds,
+            mode,
+            limit,
+            offset,
+        } = request;
         let fts_query = build_fts_query(&query, mode)?;
 
         // When project_path is given, scope results to that project's dependency tree
@@ -1073,7 +1054,6 @@ impl AppState {
                         true,
                         &["Call get_index_status and wait for status=ready"],
                         Some(pp),
-                        None,
                         Some(&snapshot_raw),
                     ));
                 }
@@ -1085,7 +1065,6 @@ impl AppState {
                         false,
                         &["Call reindex_project to retry indexing"],
                         Some(pp),
-                        None,
                         Some(msg),
                     ));
                 }
@@ -1239,7 +1218,6 @@ impl AppState {
                         false,
                         &["Use words or symbol paths like tokio::spawn"],
                         project_path,
-                        None,
                         Some(&err_text),
                     ));
                 }
@@ -1250,7 +1228,6 @@ impl AppState {
                     true,
                     &["Retry the request"],
                     project_path,
-                    None,
                     Some(&err_text),
                 ));
             }
@@ -1272,14 +1249,14 @@ impl AppState {
             if is_partial {
                 notes.push("index is still building; results may be incomplete".to_string());
             }
-            if let Some(pp) = project_path {
-                if let Ok(project) = self.get_project(pp).await {
-                    let pg = project.lock().await;
-                    let progress_guard = pg.progress.lock().await;
-                    let failed = progress_guard.failed_count;
-                    if failed > 0 {
-                        notes.push(format!("{failed} crates failed indexing"));
-                    }
+            if let Some(pp) = project_path
+                && let Ok(project) = self.get_project(pp).await
+            {
+                let pg = project.lock().await;
+                let progress_guard = pg.progress.lock().await;
+                let failed = progress_guard.failed_count;
+                if failed > 0 {
+                    notes.push(format!("{failed} crates failed indexing"));
                 }
             }
             if !notes.is_empty() {
@@ -1325,7 +1302,6 @@ impl AppState {
                 &[],
                 Some(&canonical),
                 None,
-                None,
             )),
         }
     }
@@ -1347,7 +1323,6 @@ fn extract_project_path(
                 "tool_input",
                 false,
                 &[],
-                None,
                 None,
                 None,
             )
@@ -1373,7 +1348,6 @@ fn resolve_project_path(path: &Path) -> Result<PathBuf, McpError> {
             false,
             &["Provide an existing absolute project path"],
             Some(path),
-            None,
             Some(&e.to_string()),
         )
     })
@@ -1433,7 +1407,6 @@ impl ServerHandler for AppState {
                                 &[],
                                 None,
                                 None,
-                                None,
                             )
                         })?;
                     self.register_project(path_str).await
@@ -1451,7 +1424,6 @@ impl ServerHandler for AppState {
                                 "reindex_project",
                                 false,
                                 &[],
-                                None,
                                 None,
                                 None,
                             )
@@ -1511,7 +1483,6 @@ impl ServerHandler for AppState {
                                 &[],
                                 None,
                                 None,
-                                None,
                             )
                         })?
                         .to_string();
@@ -1544,15 +1515,15 @@ impl ServerHandler for AppState {
                     let search_limit_cap = self.config.server.max_search_results.max(1);
                     let (limit, offset) =
                         extract_pagination(&call.arguments, search_limit_cap, search_limit_cap);
-                    self.search_docs(
-                        project_path.as_deref(),
+                    self.search_docs(SearchDocsRequest {
+                        project_path: project_path.as_deref(),
                         query,
                         filter_crates,
                         filter_kinds,
                         mode,
                         limit,
                         offset,
-                    )
+                    })
                     .await
                 }
                 "unregister_project" => {
@@ -1568,7 +1539,6 @@ impl ServerHandler for AppState {
                                 "unregister_project",
                                 false,
                                 &[],
-                                None,
                                 None,
                                 None,
                             )
@@ -2533,15 +2503,15 @@ mod tests {
 
         let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
         let result = app_state
-            .search_docs(
-                None,
-                "task".to_string(),
-                None,
-                None,
-                QueryMode::Auto,
-                DEFAULT_PAGE_LIMIT,
-                0,
-            )
+            .search_docs(SearchDocsRequest {
+                project_path: None,
+                query: "task".to_string(),
+                filter_crates: None,
+                filter_kinds: None,
+                mode: QueryMode::Auto,
+                limit: DEFAULT_PAGE_LIMIT,
+                offset: 0,
+            })
             .await
             .unwrap();
 
@@ -2580,15 +2550,15 @@ mod tests {
 
         let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
         let result = app_state
-            .search_docs(
-                None,
-                "task".to_string(),
-                Some(vec!["serde".to_string()]),
-                None,
-                QueryMode::Auto,
-                DEFAULT_PAGE_LIMIT,
-                0,
-            )
+            .search_docs(SearchDocsRequest {
+                project_path: None,
+                query: "task".to_string(),
+                filter_crates: Some(vec!["serde".to_string()]),
+                filter_kinds: None,
+                mode: QueryMode::Auto,
+                limit: DEFAULT_PAGE_LIMIT,
+                offset: 0,
+            })
             .await
             .unwrap();
 
@@ -2621,15 +2591,15 @@ mod tests {
         let app_state = AppState::new(cfg, db, resources::new_log_buffer(10));
 
         let first_page = app_state
-            .search_docs(
-                None,
-                "stuff".to_string(),
-                None,
-                None,
-                QueryMode::Auto,
-                50,
-                0,
-            )
+            .search_docs(SearchDocsRequest {
+                project_path: None,
+                query: "stuff".to_string(),
+                filter_crates: None,
+                filter_kinds: None,
+                mode: QueryMode::Auto,
+                limit: 50,
+                offset: 0,
+            })
             .await
             .unwrap();
         let envelope = extract_envelope(&first_page);
@@ -2638,15 +2608,15 @@ mod tests {
         assert_eq!(envelope["has_more"], false);
 
         let after_cap = app_state
-            .search_docs(
-                None,
-                "stuff".to_string(),
-                None,
-                None,
-                QueryMode::Auto,
-                50,
-                3,
-            )
+            .search_docs(SearchDocsRequest {
+                project_path: None,
+                query: "stuff".to_string(),
+                filter_crates: None,
+                filter_kinds: None,
+                mode: QueryMode::Auto,
+                limit: 50,
+                offset: 3,
+            })
             .await
             .unwrap();
         let envelope = extract_envelope(&after_cap);
@@ -3001,15 +2971,15 @@ mod tests {
 
         // Scoped search — should only include alpha and beta, NOT gamma
         let result = app_state
-            .search_docs(
-                Some(&canonical),
-                "stuff".to_string(),
-                None,
-                None,
-                QueryMode::Auto,
-                DEFAULT_PAGE_LIMIT,
-                0,
-            )
+            .search_docs(SearchDocsRequest {
+                project_path: Some(&canonical),
+                query: "stuff".to_string(),
+                filter_crates: None,
+                filter_kinds: None,
+                mode: QueryMode::Auto,
+                limit: DEFAULT_PAGE_LIMIT,
+                offset: 0,
+            })
             .await
             .unwrap();
 

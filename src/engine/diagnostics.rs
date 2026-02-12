@@ -3,7 +3,7 @@
 use crate::engine::command::{
     extract_cargo_warnings, new_cargo_command, run_with_timeout, stderr_preview,
 };
-use crate::engine::server::{tool_error_payload, ProjectProgress};
+use crate::engine::server::{ProjectProgress, tool_error_payload};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -24,7 +24,7 @@ fn command_error(
     hints: &[&str],
     raw: Option<&str>,
 ) -> Value {
-    tool_error_payload(code, message, stage, retryable, hints, None, None, raw)
+    tool_error_payload(code, message, stage, retryable, hints, None, raw)
 }
 
 fn parse_compiler_message_line(line: &str) -> Option<Value> {
@@ -163,25 +163,24 @@ pub fn summarize_audit(raw: &Value) -> Vec<Value> {
                 "patched_versions": patched_versions,
                 "affected_packages": [],
             });
-            if let Some(sev) = severity {
-                if let Some(obj) = base.as_object_mut() {
-                    obj.insert("severity".into(), Value::String(sev.to_string()));
-                }
+            if let Some(sev) = severity
+                && let Some(obj) = base.as_object_mut()
+            {
+                obj.insert("severity".into(), Value::String(sev.to_string()));
             }
             (base, HashSet::new())
         });
 
         let package_key = format!("{crate_name}@{installed_version}");
-        if seen_packages.insert(package_key) {
-            if let Some(arr) = summary
+        if seen_packages.insert(package_key)
+            && let Some(arr) = summary
                 .get_mut("affected_packages")
                 .and_then(|v| v.as_array_mut())
-            {
-                arr.push(serde_json::json!({
-                    "crate": crate_name,
-                    "installed_version": installed_version,
-                }));
-            }
+        {
+            arr.push(serde_json::json!({
+                "crate": crate_name,
+                "installed_version": installed_version,
+            }));
         }
     }
 
