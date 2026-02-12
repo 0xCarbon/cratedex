@@ -229,13 +229,16 @@ pub async fn ensure_docs_are_cached_and_indexed(
             .await
         {
             let message = e.to_string();
-            let reason = message
+            let tail = message
                 .split_once(": ")
-                .map(|(_, tail)| tail)
-                .unwrap_or(message.as_str())
+                .map(|(_, t)| t)
+                .unwrap_or(message.as_str());
+            let reason = tail
                 .lines()
-                .next()
+                .find(|l| l.trim().starts_with("error:"))
+                .or_else(|| tail.lines().next())
                 .unwrap_or("unknown generation failure")
+                .trim()
                 .to_string();
             warn!(
                 "Workspace crate {} {} failed: {}",
