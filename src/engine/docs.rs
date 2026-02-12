@@ -140,7 +140,6 @@ pub async fn ensure_docs_are_cached_and_indexed(
     info!("Docs table ready.");
 
     let mut json_paths: Vec<(Package, PathBuf)> = Vec::new();
-    let mut failure_reasons: HashMap<String, usize> = HashMap::new();
     let target_dir = metadata.target_directory.clone();
 
     for package in &index_packages {
@@ -168,8 +167,11 @@ pub async fn ensure_docs_are_cached_and_indexed(
                 .next()
                 .unwrap_or("unknown generation failure")
                 .to_string();
-            *failure_reasons.entry(reason).or_insert(0) += 1;
             let mut progress_guard = progress.lock().await;
+            *progress_guard
+                .failure_categories
+                .entry(reason)
+                .or_insert(0) += 1;
             progress_guard.failed_count += 1;
             continue;
         }
@@ -179,16 +181,20 @@ pub async fn ensure_docs_are_cached_and_indexed(
             let mut progress_guard = progress.lock().await;
             progress_guard.processed_count += 1;
         } else {
-            *failure_reasons
+            let mut progress_guard = progress.lock().await;
+            *progress_guard
+                .failure_categories
                 .entry("json not found after generation".to_string())
                 .or_insert(0) += 1;
-            let mut progress_guard = progress.lock().await;
             progress_guard.failed_count += 1;
         }
     }
 
-    for (reason, count) in &failure_reasons {
-        warn!("{count} crates failed doc generation: {reason}");
+    {
+        let progress_guard = progress.lock().await;
+        for (reason, count) in &progress_guard.failure_categories {
+            warn!("{count} crates failed doc generation: {reason}");
+        }
     }
 
     info!(

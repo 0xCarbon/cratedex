@@ -94,6 +94,102 @@ fn summarize_one(diag: &Value) -> Option<Value> {
     Some(summary)
 }
 
+/// Summarize raw `cargo audit --json` output into compact advisory objects.
+///
+/// Extracts per-advisory: id, title, severity, crate_name, installed_version, patched_versions.
+/// Deduplicates by advisory ID.
+pub fn summarize_audit(raw: &Value) -> Vec<Value> {
+    let Some(vulnerabilities) = raw.get("vulnerabilities") else {
+        // If it's an error object or null, return empty
+        return Vec::new();
+    };
+    let Some(list) = vulnerabilities.get("list").and_then(|l| l.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut results = Vec::new();
+
+    for entry in list {
+        let advisory = match entry.get("advisory") {
+            Some(a) => a,
+            None => continue,
+        };
+        let id = advisory
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        // Deduplicate by advisory ID
+        if !seen_ids.insert(id.to_string()) {
+            continue;
+        }
+
+        let title = advisory
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        let severity = advisory
+            .get("cvss")
+            .and_then(|c| c.as_str())
+            .or_else(|| advisory.get("severity").and_then(|s| s.as_str()));
+
+        let crate_name = entry
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let installed_version = entry
+            .get("package")
+            .and_then(|p| p.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let patched_versions = advisory
+            .get("patched_versions")
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let mut summary = serde_json::json!({
+            "id": id,
+            "title": title,
+            "crate": crate_name,
+            "installed_version": installed_version,
+            "patched_versions": patched_versions,
+        });
+        if let Some(sev) = severity {
+            summary
+                .as_object_mut()
+                .unwrap()
+                .insert("severity".into(), Value::String(sev.to_string()));
+        }
+        results.push(summary);
+    }
+
+    results
+}
+
+/// Summarize raw `cargo outdated --format json` output into compact objects.
+///
+/// Extracts per-dep: name, current version, latest version, kind.
+pub fn summarize_outdated(raw: &Value) -> Vec<Value> {
+    let Some(deps) = raw.get("dependencies").and_then(|d| d.as_array()) else {
+        // If it's an error object or null, return empty
+        return Vec::new();
+    };
+
+    deps.iter()
+        .map(|dep| {
+            serde_json::json!({
+                "name": dep.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+                "current": dep.get("project").and_then(|v| v.as_str()).unwrap_or_default(),
+                "latest": dep.get("latest").and_then(|v| v.as_str()).unwrap_or_default(),
+                "kind": dep.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            })
+        })
+        .collect()
+}
+
 /// Runs `cargo check` in the background and continuously updates the diagnostics cache.
 pub async fn run_check_on_startup(
     diagnostics_cache: Arc<Mutex<Vec<Value>>>,

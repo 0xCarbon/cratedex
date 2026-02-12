@@ -73,6 +73,7 @@ pub struct CargoWarning {
 pub struct ProjectProgress {
     pub phase: Phase,
     pub started_at: Instant,
+    pub indexing_started_at: Option<Instant>,
     pub total_dependencies: usize,
     pub new_dependencies: usize,
     pub already_indexed: usize,
@@ -81,6 +82,7 @@ pub struct ProjectProgress {
     pub current_crate: Option<String>,
     pub cargo_warnings: Vec<CargoWarning>,
     pub estimated_total_secs: Option<f64>,
+    pub failure_categories: HashMap<String, usize>,
 }
 
 impl Default for ProjectProgress {
@@ -94,6 +96,7 @@ impl ProjectProgress {
         Self {
             phase: Phase::Metadata,
             started_at: Instant::now(),
+            indexing_started_at: None,
             total_dependencies: 0,
             new_dependencies: 0,
             already_indexed: 0,
@@ -102,6 +105,7 @@ impl ProjectProgress {
             current_crate: None,
             cargo_warnings: Vec::new(),
             estimated_total_secs: None,
+            failure_categories: HashMap::new(),
         }
     }
 
@@ -128,8 +132,15 @@ impl ProjectProgress {
         let estimated_remaining_secs = if matches!(self.phase, Phase::Indexing) {
             let done = self.processed_count + self.failed_count;
             let remaining = self.new_dependencies.saturating_sub(done);
-            if done > 0 {
-                let elapsed = self.started_at.elapsed().as_secs_f64();
+            if remaining == 0 {
+                // Phase 1 done but Phase 2 (DB indexing) still running — no estimate available
+                None
+            } else if done > 0 {
+                let elapsed = self
+                    .indexing_started_at
+                    .unwrap_or(self.started_at)
+                    .elapsed()
+                    .as_secs_f64();
                 let per_crate = elapsed / done as f64;
                 Some(per_crate * remaining as f64)
             } else {
@@ -143,6 +154,11 @@ impl ProjectProgress {
             Phase::Failed(msg) => Some(msg.clone()),
             _ => None,
         };
+        let indexing_failures: serde_json::Value = if self.failure_categories.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(self.failure_categories)
+        };
         serde_json::json!({
             "phase": self.phase.as_str(),
             "processed": self.processed_count,
@@ -152,7 +168,8 @@ impl ProjectProgress {
             "already_indexed": self.already_indexed,
             "current_crate": self.current_crate,
             "estimated_remaining_secs": estimated_remaining_secs,
-            "cargo_warnings": self.cargo_warnings,
+            "cargo_warning_count": self.cargo_warnings.len(),
+            "indexing_failures": indexing_failures,
             "failed_message": failed_message
         })
     }
@@ -400,6 +417,7 @@ impl AppState {
             {
                 let mut pg = progress.lock().await;
                 pg.phase = Phase::Indexing;
+                pg.indexing_started_at = Some(Instant::now());
             }
 
             let result = tokio::select! {
@@ -543,18 +561,18 @@ impl AppState {
         let raw_diagnostics = project_guard.diagnostics.lock().await.clone();
         let outdated_dependencies = project_guard.outdated_dependencies.lock().await.clone();
         let security_advisories = project_guard.security_advisories.lock().await.clone();
-        let progress_snapshot = project_guard.progress.lock().await.to_json();
-        let cargo_warnings = progress_snapshot
-            .get("cargo_warnings")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
+        let cargo_warnings: Vec<_> = project_guard
+            .progress
+            .lock()
+            .await
+            .cargo_warnings
+            .clone();
         let build_diagnostics = diagnostics::summarize_diagnostics(&raw_diagnostics);
         let combined_report = serde_json::json!({
             "build_diagnostics": build_diagnostics,
-            "outdated_dependencies": outdated_dependencies,
-            "security_advisories": security_advisories,
+            "outdated_dependencies": diagnostics::summarize_outdated(&outdated_dependencies),
+            "security_advisories": diagnostics::summarize_audit(&security_advisories),
             "cargo_warnings": cargo_warnings,
-            "project_progress": progress_snapshot,
         });
         let content = Content::json(combined_report)?;
         Ok(CallToolResult::success(vec![content]))
@@ -574,19 +592,32 @@ impl AppState {
         }
 
         // When project_path is given, scope results to that project's dependency tree
+        let mut is_partial = false;
+        let mut indexing_progress: Option<serde_json::Value> = None;
         let scope_crates: Option<Vec<docs::ProjectCrate>> = if let Some(pp) = project_path {
             let project = self.get_project(pp).await?;
             let project_guard = project.lock().await;
 
             let progress_guard = project_guard.progress.lock().await;
-            if !matches!(progress_guard.phase, Phase::Ready) {
-                let phase = progress_guard.phase.as_str();
-                let snapshot = progress_guard.to_json();
-                drop(progress_guard);
-                let reason = format!(
-                    "Documentation index is not ready (phase: {phase}). Current progress: {snapshot}"
-                );
-                return Err(McpError::internal_error(reason, None));
+            match &progress_guard.phase {
+                Phase::Metadata | Phase::Check => {
+                    let phase = progress_guard.phase.as_str();
+                    let snapshot = progress_guard.to_json();
+                    drop(progress_guard);
+                    let reason = format!(
+                        "Documentation index is not ready (phase: {phase}). Current progress: {snapshot}"
+                    );
+                    return Err(McpError::internal_error(reason, None));
+                }
+                Phase::Failed(msg) => {
+                    let reason = format!("Documentation indexing failed: {msg}");
+                    return Err(McpError::internal_error(reason, None));
+                }
+                Phase::Indexing => {
+                    is_partial = true;
+                    indexing_progress = Some(progress_guard.to_json());
+                }
+                Phase::Ready => {}
             }
             drop(progress_guard);
 
@@ -666,7 +697,7 @@ impl AppState {
                 d.crate_version,
                 d.item_name,
                 d.kind,
-                highlight(docs_fts, 2, '<mark>', '</mark>') as text,
+                snippet(docs_fts, 2, '<mark>', '</mark>', '...', 40) as text,
                 bm25(docs_fts, 1.0, 2.0, 1.0) as score
             FROM docs_fts
             JOIN docs d ON d.id = docs_fts.rowid
@@ -708,7 +739,38 @@ impl AppState {
 
         let total = all_results.len();
         let page: Vec<_> = all_results.into_iter().skip(offset).take(limit).collect();
-        let envelope = paginated_response(serde_json::json!(page), total, offset);
+        let mut envelope = paginated_response(serde_json::json!(page), total, offset);
+
+        if is_partial {
+            envelope["partial"] = serde_json::json!(true);
+            if let Some(progress) = indexing_progress {
+                envelope["indexing_progress"] = progress;
+            }
+        }
+
+        // Issue 5: explain zero results when project-scoped
+        if total == 0 && project_path.is_some() {
+            let mut notes = Vec::new();
+            if is_partial {
+                notes.push("Indexing is still in progress — not all crates are searchable yet".to_string());
+            }
+            if let Some(pp) = project_path {
+                if let Ok(project) = self.get_project(pp).await {
+                    let pg = project.lock().await;
+                    let progress_guard = pg.progress.lock().await;
+                    let failed = progress_guard.failed_count;
+                    if failed > 0 {
+                        notes.push(format!(
+                            "{failed} crates failed indexing (see list_projects for details)"
+                        ));
+                    }
+                }
+            }
+            if !notes.is_empty() {
+                envelope["notes"] = serde_json::json!(notes);
+            }
+        }
+
         let content = json_content(envelope)?;
         Ok(CallToolResult::success(vec![content]))
     }
@@ -1023,7 +1085,8 @@ impl ServerHandler for AppState {
                                     "failed": { "type": "integer" },
                                     "total": { "type": "integer" },
                                     "estimated_remaining_secs": { "type": ["number", "null"] },
-                                    "cargo_warnings": { "type": "array" },
+                                    "cargo_warning_count": { "type": "integer" },
+                                    "indexing_failures": { "type": ["object", "null"] },
                                     "diagnostics_count": { "type": "integer" }
                                 }
                             }
@@ -1090,8 +1153,8 @@ impl ServerHandler for AppState {
                             "type": "object",
                             "properties": {
                                 "build_diagnostics": { "type": "array", "items": { "type": "object" } },
-                                "outdated_dependencies": {},
-                                "security_advisories": {},
+                                "outdated_dependencies": { "type": "array", "items": { "type": "object" } },
+                                "security_advisories": { "type": "array", "items": { "type": "object" } },
                                 "cargo_warnings": {
                                     "type": "array",
                                     "items": {
@@ -1102,10 +1165,9 @@ impl ServerHandler for AppState {
                                             "count": { "type": "integer" }
                                         }
                                     }
-                                },
-                                "project_progress": { "type": "object" }
+                                }
                             },
-                            "required": ["build_diagnostics", "outdated_dependencies", "security_advisories", "cargo_warnings", "project_progress"]
+                            "required": ["build_diagnostics", "outdated_dependencies", "security_advisories", "cargo_warnings"]
                         })
                         .as_object()
                         .cloned()
@@ -1631,6 +1693,7 @@ mod tests {
     fn to_json_estimated_remaining_only_during_indexing() {
         let mut progress = ProjectProgress::new();
         progress.estimated_total_secs = Some(100.0);
+        progress.new_dependencies = 10;
 
         // During Metadata phase, estimated_remaining_secs should be null
         progress.phase = Phase::Metadata;
@@ -1642,10 +1705,16 @@ mod tests {
         let json = progress.to_json();
         assert!(json["estimated_remaining_secs"].is_null());
 
-        // During Indexing phase, estimated_remaining_secs should be a number
+        // During Indexing phase with remaining work, estimated_remaining_secs should be a number
         progress.phase = Phase::Indexing;
         let json = progress.to_json();
         assert!(json["estimated_remaining_secs"].is_number());
+
+        // When all crates are done but still in Indexing phase (Phase 2), should be null
+        progress.processed_count = 8;
+        progress.failed_count = 2;
+        let json = progress.to_json();
+        assert!(json["estimated_remaining_secs"].is_null());
     }
 
     /// Helper to extract the JSON text from a CallToolResult's first content item.
@@ -2534,8 +2603,9 @@ mod tests {
             report_a["build_diagnostics"][0]["message"],
             "error in project A"
         );
-        assert_eq!(report_a["outdated_dependencies"]["dep_a"], "outdated");
-        assert!(report_a["security_advisories"].is_null());
+        // outdated/audit are now summarized — raw values without proper structure return empty arrays
+        assert!(report_a["outdated_dependencies"].is_array());
+        assert!(report_a["security_advisories"].is_array());
 
         // Verify project B diagnostics (different from A)
         let result_b = app_state.get_diagnostics(&path_b).await.unwrap();
@@ -2545,7 +2615,7 @@ mod tests {
             report_b["build_diagnostics"][0]["message"],
             "warning in project B"
         );
-        assert!(report_b["outdated_dependencies"].is_null());
-        assert_eq!(report_b["security_advisories"]["vuln"], "found");
+        assert!(report_b["outdated_dependencies"].is_array());
+        assert!(report_b["security_advisories"].is_array());
     }
 }
