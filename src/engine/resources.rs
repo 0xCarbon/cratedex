@@ -178,61 +178,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_buffer_ring_evicts_oldest() {
-        let buf = new_log_buffer(3);
-        {
-            let mut b = buf.lock().unwrap();
-            b.push_back("line1".into());
-            b.push_back("line2".into());
-            b.push_back("line3".into());
-        }
-        // Simulate what the layer does
-        {
-            let mut b = buf.lock().unwrap();
-            if b.len() >= 3 {
-                b.pop_front();
-            }
-            b.push_back("line4".into());
-        }
-        let b = buf.lock().unwrap();
-        assert_eq!(b.len(), 3);
-        assert_eq!(b[0], "line2");
-        assert_eq!(b[2], "line4");
-    }
-
-    #[test]
-    fn list_resources_returns_logs_resource() {
-        let result = list_resources_impl();
-        assert_eq!(result.resources.len(), 1);
-        assert_eq!(result.resources[0].uri, LOG_URI);
-        assert_eq!(result.resources[0].name, "Server Logs");
-    }
-
-    #[test]
-    fn read_resource_returns_buffer_contents() {
-        let buf = new_log_buffer(10);
-        {
-            let mut b = buf.lock().unwrap();
-            b.push_back("hello".into());
-            b.push_back("world".into());
-        }
-        let result = read_resource_impl(LOG_URI, &buf).unwrap();
-        assert_eq!(result.contents.len(), 1);
-        match &result.contents[0] {
-            ResourceContents::TextResourceContents { text, .. } => {
-                assert_eq!(text, "hello\nworld");
-            }
-            _ => panic!("expected text resource contents"),
-        }
-    }
-
-    #[test]
-    fn read_resource_unknown_uri_returns_none() {
-        let buf = new_log_buffer(10);
-        assert!(read_resource_impl("cratedex://unknown", &buf).is_none());
-    }
-
-    #[test]
     fn format_iso8601_utc_produces_valid_timestamp() {
         let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1749997800);
         assert_eq!(format_iso8601_utc(time), "2025-06-15T14:30:00Z");

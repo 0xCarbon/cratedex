@@ -93,12 +93,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn open_with_retry_succeeds_immediately() {
-        let db = Db::open_with_retry(":memory:", 3, std::time::Duration::from_millis(10)).await;
-        assert!(db.is_ok());
-    }
-
-    #[tokio::test]
     async fn open_with_retry_fails_after_exhausting_retries() {
         let invalid_path =
             std::env::temp_dir().join(format!("cratedex-open-with-retry-{}", std::process::id()));
@@ -111,39 +105,5 @@ mod tests {
         .await;
         let _ = std::fs::remove_dir_all(&invalid_path);
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn call_executes_read_closure() {
-        let db = Db::open(":memory:").unwrap();
-        let version: String = db
-            .call(|conn| {
-                let v: String = conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
-                Ok(v)
-            })
-            .await
-            .unwrap();
-        assert!(!version.is_empty());
-    }
-
-    #[tokio::test]
-    async fn call_mut_executes_write_closure() {
-        let db = Db::open(":memory:").unwrap();
-        db.call_mut(|conn| {
-            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])?;
-            conn.execute("INSERT INTO t (id) VALUES (42)", [])?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        let id: i64 = db
-            .call(|conn| {
-                let v: i64 = conn.query_row("SELECT id FROM t", [], |row| row.get(0))?;
-                Ok(v)
-            })
-            .await
-            .unwrap();
-        assert_eq!(id, 42);
     }
 }

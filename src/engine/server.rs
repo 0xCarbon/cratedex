@@ -40,6 +40,35 @@ use tracing::{error, info, info_span, warn};
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 200;
+const DEFAULT_DETAIL_LIMIT: usize = 20;
+const MAX_DETAIL_LIMIT: usize = 100;
+
+#[derive(Clone, Copy, Debug)]
+pub enum QueryMode {
+    Auto,
+    Text,
+    Symbol,
+}
+
+impl QueryMode {
+    fn parse(raw: Option<&str>) -> Result<Self, McpError> {
+        match raw.unwrap_or("auto") {
+            "auto" => Ok(Self::Auto),
+            "text" => Ok(Self::Text),
+            "symbol" => Ok(Self::Symbol),
+            other => Err(invalid_tool_error(
+                "INVALID_QUERY_MODE",
+                &format!("invalid query mode '{other}'"),
+                "search_docs",
+                false,
+                &["Use one of: auto, text, symbol"],
+                None,
+                None,
+                None,
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Phase {
@@ -51,10 +80,20 @@ pub enum Phase {
 }
 
 impl Phase {
+    #[cfg(test)]
     fn as_str(&self) -> &'static str {
         match self {
             Self::Metadata => "metadata",
             Self::Check => "check",
+            Self::Indexing => "indexing",
+            Self::Ready => "ready",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Metadata | Self::Check => "queued",
             Self::Indexing => "indexing",
             Self::Ready => "ready",
             Self::Failed(_) => "failed",
@@ -127,52 +166,153 @@ impl ProjectProgress {
         }
     }
 
-    pub fn to_json(&self) -> serde_json::Value {
-        // Estimate remaining time from actual throughput during indexing.
-        let estimated_remaining_secs = if matches!(self.phase, Phase::Indexing) {
-            let done = self.processed_count + self.failed_count;
-            let remaining = self.new_dependencies.saturating_sub(done);
-            if remaining == 0 {
-                // Phase 1 done but Phase 2 (DB indexing) still running — no estimate available
-                None
-            } else if done > 0 {
-                let elapsed = self
-                    .indexing_started_at
-                    .unwrap_or(self.started_at)
-                    .elapsed()
-                    .as_secs_f64();
-                let per_crate = elapsed / done as f64;
-                Some(per_crate * remaining as f64)
-            } else {
-                // No data yet — fall back to static estimate
-                self.estimated_total_secs
-            }
-        } else {
-            None
-        };
-        let failed_message = match &self.phase {
-            Phase::Failed(msg) => Some(msg.clone()),
-            _ => None,
-        };
-        let indexing_failures: serde_json::Value = if self.failure_categories.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::json!(self.failure_categories)
-        };
-        serde_json::json!({
-            "phase": self.phase.as_str(),
-            "processed": self.processed_count,
-            "failed": self.failed_count,
-            "total": self.total_dependencies,
-            "new_dependencies": self.new_dependencies,
-            "already_indexed": self.already_indexed,
-            "current_crate": self.current_crate,
-            "estimated_remaining_secs": estimated_remaining_secs,
-            "cargo_warning_count": self.cargo_warnings.len(),
-            "indexing_failures": indexing_failures,
-            "failed_message": failed_message
-        })
+    fn completed(&self) -> usize {
+        self.processed_count + self.failed_count
     }
+
+    fn eta_secs(&self) -> Option<f64> {
+        if !matches!(self.phase, Phase::Indexing) {
+            return None;
+        }
+        let done = self.completed();
+        let remaining = self.new_dependencies.saturating_sub(done);
+        if remaining == 0 {
+            return None;
+        }
+        if done == 0 {
+            return self.estimated_total_secs;
+        }
+        let elapsed = self
+            .indexing_started_at
+            .unwrap_or(self.started_at)
+            .elapsed()
+            .as_secs_f64();
+        let per_crate = elapsed / done as f64;
+        Some(per_crate * remaining as f64)
+    }
+
+    fn percent(&self) -> u64 {
+        if self.new_dependencies == 0 {
+            return if matches!(self.phase, Phase::Ready) {
+                100
+            } else {
+                0
+            };
+        }
+        ((self.completed().saturating_mul(100)) / self.new_dependencies).min(100) as u64
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::json!({
+            "status": self.phase.status(),
+            "processed": self.completed(),
+            "total": self.new_dependencies,
+            "percent": self.percent(),
+            "eta_secs": self.eta_secs(),
+        });
+
+        let map = obj
+            .as_object_mut()
+            .expect("status JSON should always be an object");
+        if self.failed_count > 0 {
+            map.insert("failed".to_string(), serde_json::json!(self.failed_count));
+        }
+        if matches!(self.phase, Phase::Indexing)
+            && let Some(current) = self.current_crate.as_ref()
+        {
+            map.insert("current_crate".to_string(), serde_json::json!(current));
+        }
+        if let Phase::Failed(msg) = &self.phase {
+            map.insert("error".to_string(), serde_json::json!(msg));
+        }
+
+        obj
+    }
+}
+
+pub fn tool_error_payload(
+    code: &str,
+    message: &str,
+    stage: &str,
+    retryable: bool,
+    hints: &[&str],
+    project_path: Option<&Path>,
+    crate_name: Option<&str>,
+    debug_raw: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "code": code,
+        "message": message,
+        "stage": stage,
+        "retryable": retryable,
+        "hints": hints,
+    });
+    let obj = payload
+        .as_object_mut()
+        .expect("error payload should always be an object");
+    if let Some(path) = project_path {
+        obj.insert(
+            "project_path".to_string(),
+            serde_json::json!(path.display().to_string()),
+        );
+    }
+    if let Some(name) = crate_name {
+        obj.insert("crate".to_string(), serde_json::json!(name));
+    }
+    if let Some(raw) = debug_raw {
+        obj.insert("debug".to_string(), serde_json::json!({ "raw": raw }));
+    }
+    payload
+}
+
+fn invalid_tool_error(
+    code: &str,
+    message: &str,
+    stage: &str,
+    retryable: bool,
+    hints: &[&str],
+    project_path: Option<&Path>,
+    crate_name: Option<&str>,
+    debug_raw: Option<&str>,
+) -> McpError {
+    McpError::invalid_params(
+        message.to_string(),
+        Some(tool_error_payload(
+            code,
+            message,
+            stage,
+            retryable,
+            hints,
+            project_path,
+            crate_name,
+            debug_raw,
+        )),
+    )
+}
+
+fn internal_tool_error(
+    code: &str,
+    message: &str,
+    stage: &str,
+    retryable: bool,
+    hints: &[&str],
+    project_path: Option<&Path>,
+    crate_name: Option<&str>,
+    debug_raw: Option<&str>,
+) -> McpError {
+    McpError::internal_error(
+        message.to_string(),
+        Some(tool_error_payload(
+            code,
+            message,
+            stage,
+            retryable,
+            hints,
+            project_path,
+            crate_name,
+            debug_raw,
+        )),
+    )
 }
 
 /// Extract and validate `limit` and `offset` from tool call arguments.
@@ -211,6 +351,95 @@ fn paginated_response(items: serde_json::Value, total: usize, offset: usize) -> 
         "next_offset": next_offset,
         "items": items,
     })
+}
+
+fn search_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_lowercase())
+        })
+        .collect()
+}
+
+fn build_fts_query(query: &str, mode: QueryMode) -> Result<String, McpError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(invalid_tool_error(
+            "EMPTY_QUERY",
+            "query must not be empty",
+            "search_docs",
+            false,
+            &["Provide at least one search term"],
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let resolved = match mode {
+        QueryMode::Auto if query.contains("::") => QueryMode::Symbol,
+        QueryMode::Auto => QueryMode::Text,
+        explicit => explicit,
+    };
+
+    let tokens = match resolved {
+        QueryMode::Text | QueryMode::Symbol => search_tokens(query),
+        QueryMode::Auto => unreachable!("auto mode is resolved above"),
+    };
+    if tokens.is_empty() {
+        return Err(invalid_tool_error(
+            "INVALID_QUERY",
+            "query did not contain searchable terms",
+            "search_docs",
+            false,
+            &["Use words or symbols like tokio::spawn"],
+            None,
+            None,
+            None,
+        ));
+    }
+
+    Ok(tokens
+        .into_iter()
+        .map(|t| format!("{t}*"))
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+fn summarize_build_levels(items: &[serde_json::Value]) -> serde_json::Value {
+    let errors = items
+        .iter()
+        .filter(|d| d["level"].as_str() == Some("error"))
+        .count();
+    let warnings = items
+        .iter()
+        .filter(|d| d["level"].as_str() == Some("warning"))
+        .count();
+    serde_json::json!({
+        "total": items.len(),
+        "errors": errors,
+        "warnings": warnings,
+    })
+}
+
+fn normalize_tool_error(section_raw: &serde_json::Value, stage: &str) -> Option<serde_json::Value> {
+    let err = section_raw.get("error")?;
+    if err.is_object() {
+        return Some(err.clone());
+    }
+    let msg = err.as_str().unwrap_or("tool execution failed");
+    Some(tool_error_payload(
+        "COMMAND_FAILED",
+        msg,
+        stage,
+        true,
+        &[],
+        None,
+        None,
+        None,
+    ))
 }
 
 /// Per-project state held in the project registry.
@@ -256,40 +485,49 @@ impl AppState {
         let canonical = resolve_project_path(project_path)?;
         let registry = self.projects.read().await;
         registry.get(&canonical).cloned().ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "Project not registered: {}. Call register_project first.",
-                    canonical.display()
-                ),
+            invalid_tool_error(
+                "PROJECT_NOT_REGISTERED",
+                "project is not registered",
+                "project_lookup",
+                false,
+                &["Call register_project first"],
+                Some(&canonical),
+                None,
                 None,
             )
         })
     }
 
-    // ───── Tool implementations ─────
-
-    pub async fn register_project(
+    async fn create_project_state(
         &self,
-        project_path_raw: &str,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        let raw = PathBuf::from(project_path_raw);
-        let canonical = resolve_project_path(&raw)?;
-
-        // Validate: must contain Cargo.toml
-        if !canonical.join("Cargo.toml").exists() {
-            return Err(McpError::invalid_params(
-                format!("No Cargo.toml found in {}", canonical.display()),
-                None,
-            ));
-        }
-
-        info!("Registering project: {}", canonical.display());
-
-        let meta = crate::engine::metadata::load_metadata(&canonical)
+        canonical: &Path,
+    ) -> Result<(Arc<Mutex<ProjectState>>, tokio::sync::watch::Receiver<()>), McpError> {
+        let meta = crate::engine::metadata::load_metadata(canonical)
             .await
-            .mcp_internal_err("Failed to load cargo metadata")?;
-        let index_packages = docs::collect_index_packages(&meta)
-            .mcp_internal_err("Failed to collect dependency package list")?;
+            .map_err(|e| {
+                internal_tool_error(
+                    "METADATA_LOAD_FAILED",
+                    "failed to load cargo metadata",
+                    "register_project",
+                    false,
+                    &["Ensure the project has a valid Cargo workspace"],
+                    Some(canonical),
+                    None,
+                    Some(&e.to_string()),
+                )
+            })?;
+        let index_packages = docs::collect_index_packages(&meta).map_err(|e| {
+            internal_tool_error(
+                "COLLECT_PACKAGES_FAILED",
+                "failed to collect dependency package list",
+                "register_project",
+                false,
+                &[],
+                Some(canonical),
+                None,
+                Some(&e.to_string()),
+            )
+        })?;
         let package_hashes: Vec<String> =
             index_packages.iter().map(docs::package_id_hash).collect();
         let already_indexed = self
@@ -304,7 +542,19 @@ impl AppState {
                 Ok(count)
             })
             .await
-            .mcp_internal_err("Failed to inspect existing documentation index state")?;
+            .map_err(|e| {
+                internal_tool_error(
+                    "INDEX_INSPECTION_FAILED",
+                    "failed to inspect documentation index state",
+                    "register_project",
+                    true,
+                    &["Retry the request"],
+                    Some(canonical),
+                    None,
+                    Some(&e.to_string()),
+                )
+            })?;
+
         let total_dependencies = index_packages.len();
         let new_dependencies = total_dependencies.saturating_sub(already_indexed);
         let estimated_total_secs = new_dependencies as f64 * 1.5;
@@ -317,7 +567,7 @@ impl AppState {
         progress.estimated_total_secs = Some(estimated_total_secs);
 
         let project = Arc::new(Mutex::new(ProjectState {
-            project_path: canonical.clone(),
+            project_path: canonical.to_path_buf(),
             metadata: Arc::new(meta),
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
@@ -326,37 +576,18 @@ impl AppState {
             abort: Some(abort_tx),
         }));
 
-        // Single write lock: check limit, abort old watcher, and insert atomically
-        // to prevent TOCTOU race where concurrent registrations both pass the limit.
-        {
-            let mut registry = self.projects.write().await;
-            let is_new_project = !registry.contains_key(&canonical);
-            if is_new_project && registry.len() >= self.config.server.max_projects {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "Project limit reached ({}). Unregister a project before adding another.",
-                        self.config.server.max_projects
-                    ),
-                    None,
-                ));
-            }
-            // Abort all old background tasks before overwriting
-            if let Some(old) = registry.get(&canonical) {
-                let old_guard = old.lock().await;
-                if let Some(tx) = &old_guard.abort {
-                    let _ = tx.send(());
-                }
-            }
-            registry.insert(canonical.clone(), Arc::clone(&project));
-        }
+        Ok((project, abort_rx))
+    }
 
-        // Spawn background tasks — each gets a clone of the abort receiver
-        // so that re-registration cancels all outstanding work.
+    async fn spawn_project_tasks(
+        &self,
+        project: Arc<Mutex<ProjectState>>,
+        canonical: PathBuf,
+        abort_rx: tokio::sync::watch::Receiver<()>,
+    ) {
         {
             let project_guard = project.lock().await;
 
-            // cargo outdated and cargo audit don't use the build directory,
-            // so they can run concurrently with everything else.
             let outdated_cache = Arc::clone(&project_guard.outdated_dependencies);
             let progress = Arc::clone(&project_guard.progress);
             let proj_path = canonical.clone();
@@ -380,15 +611,12 @@ impl AppState {
             });
         }
 
-        // Run cargo check first, then doc indexing — serialized to avoid
-        // file lock contention on the cargo package cache / build directory.
         let project_clone = Arc::clone(&project);
         let db_clone = Arc::clone(&self.db);
         let proj_path = canonical.clone();
         let mut abort_check_docs = abort_rx.clone();
 
         tokio::spawn(async move {
-            // Step 1: cargo check (compiles everything, populates build cache)
             {
                 let guard = project_clone.lock().await;
                 let diag_cache = Arc::clone(&guard.diagnostics);
@@ -408,7 +636,6 @@ impl AppState {
                 }
             }
 
-            // Step 2: doc indexing (reuses cached build artifacts)
             let (metadata_clone, progress) = {
                 let guard = project_clone.lock().await;
                 (Arc::clone(&guard.metadata), Arc::clone(&guard.progress))
@@ -438,7 +665,7 @@ impl AppState {
                     info!("Documentation index is ready.");
                 }
                 Err(e) => {
-                    let msg = format!("{}", e);
+                    let msg = e.to_string();
                     error!("Failed to ensure docs are cached: {}", msg);
                     let mut pg = progress.lock().await;
                     pg.phase = Phase::Failed(msg);
@@ -447,7 +674,6 @@ impl AppState {
             }
         });
 
-        // Spawn file watcher
         if self.config.watcher.enabled {
             let project_guard = project.lock().await;
             let diag_cache_for_watcher = Arc::clone(&project_guard.diagnostics);
@@ -472,14 +698,142 @@ impl AppState {
                 }
             });
         }
+    }
 
-        let project_progress = {
-            let guard = project.lock().await;
-            guard.progress.lock().await.to_json()
+    async fn project_index_status(&self, project: &Arc<Mutex<ProjectState>>) -> serde_json::Value {
+        let guard = project.lock().await;
+        guard.progress.lock().await.to_json()
+    }
+
+    // ───── Tool implementations ─────
+
+    pub async fn register_project(
+        &self,
+        project_path_raw: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let raw = PathBuf::from(project_path_raw);
+        let canonical = resolve_project_path(&raw)?;
+
+        if !canonical.join("Cargo.toml").exists() {
+            return Err(invalid_tool_error(
+                "MISSING_CARGO_TOML",
+                "no Cargo.toml found in project path",
+                "register_project",
+                false,
+                &[],
+                Some(&canonical),
+                None,
+                None,
+            ));
+        }
+
+        // Single write lock: check existence, check limit, and insert atomically
+        // to prevent TOCTOU races where concurrent registrations both pass the limit.
+        let (project, abort_rx) = {
+            let mut registry = self.projects.write().await;
+
+            if let Some(existing) = registry.get(&canonical).cloned() {
+                drop(registry);
+                let response = serde_json::json!({
+                    "status": "already_registered",
+                    "project_path": canonical.display().to_string(),
+                    "index": self.project_index_status(&existing).await,
+                });
+                let content = json_content(response)?;
+                return Ok(CallToolResult::success(vec![content]));
+            }
+
+            if registry.len() >= self.config.server.max_projects {
+                return Err(invalid_tool_error(
+                    "PROJECT_LIMIT_REACHED",
+                    "project limit reached",
+                    "register_project",
+                    false,
+                    &["Unregister a project before adding another"],
+                    None,
+                    None,
+                    None,
+                ));
+            }
+
+            info!("Registering project: {}", canonical.display());
+            let (project, abort_rx) = self.create_project_state(&canonical).await?;
+            registry.insert(canonical.clone(), Arc::clone(&project));
+            (project, abort_rx)
         };
-        let mut response = project_progress;
-        response["status"] = serde_json::json!("registered");
-        response["project_path"] = serde_json::json!(canonical.display().to_string());
+
+        self.spawn_project_tasks(Arc::clone(&project), canonical.clone(), abort_rx)
+            .await;
+
+        let response = serde_json::json!({
+            "status": "registered",
+            "project_path": canonical.display().to_string(),
+            "index": self.project_index_status(&project).await,
+        });
+        let content = json_content(response)?;
+        Ok(CallToolResult::success(vec![content]))
+    }
+
+    pub async fn reindex_project(
+        &self,
+        project_path_raw: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let raw = PathBuf::from(project_path_raw);
+        let canonical = resolve_project_path(&raw)?;
+        if !canonical.join("Cargo.toml").exists() {
+            return Err(invalid_tool_error(
+                "MISSING_CARGO_TOML",
+                "no Cargo.toml found in project path",
+                "reindex_project",
+                false,
+                &[],
+                Some(&canonical),
+                None,
+                None,
+            ));
+        }
+
+        // Abort old tasks before creating new state to avoid concurrent cargo
+        // processes competing for file locks on the same project directory.
+        {
+            let registry = self.projects.read().await;
+            match registry.get(&canonical) {
+                None => {
+                    return Err(invalid_tool_error(
+                        "PROJECT_NOT_REGISTERED",
+                        "project is not registered",
+                        "reindex_project",
+                        false,
+                        &["Call register_project first"],
+                        Some(&canonical),
+                        None,
+                        None,
+                    ));
+                }
+                Some(old) => {
+                    let old_guard = old.lock().await;
+                    if let Some(tx) = &old_guard.abort {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        }
+
+        info!("Reindexing project: {}", canonical.display());
+        let (project, abort_rx) = self.create_project_state(&canonical).await?;
+        {
+            let mut registry = self.projects.write().await;
+            registry.insert(canonical.clone(), Arc::clone(&project));
+        }
+
+        self.spawn_project_tasks(Arc::clone(&project), canonical.clone(), abort_rx)
+            .await;
+
+        let response = serde_json::json!({
+            "status": "reindexing",
+            "project_path": canonical.display().to_string(),
+            "index": self.project_index_status(&project).await,
+        });
         let content = json_content(response)?;
         Ok(CallToolResult::success(vec![content]))
     }
@@ -499,9 +853,7 @@ impl AppState {
 
         let mut entries = Vec::with_capacity(projects.len());
         for (path, state) in projects {
-            let state_guard = state.lock().await;
-            let progress_snapshot = state_guard.progress.lock().await.to_json();
-            let diagnostics_count = state_guard.diagnostics.lock().await.len();
+            let progress_snapshot = self.project_index_status(&state).await;
             let mut entry = progress_snapshot;
             let obj = entry
                 .as_object_mut()
@@ -509,10 +861,6 @@ impl AppState {
             obj.insert(
                 "project_path".to_string(),
                 serde_json::Value::String(path.display().to_string()),
-            );
-            obj.insert(
-                "diagnostics_count".to_string(),
-                serde_json::Value::Number(diagnostics_count.into()),
             );
             entries.push(entry);
         }
@@ -526,6 +874,19 @@ impl AppState {
         let page: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
         let envelope = paginated_response(serde_json::json!(page), total, offset);
         let content = json_content(envelope)?;
+        Ok(CallToolResult::success(vec![content]))
+    }
+
+    pub async fn get_index_status(
+        &self,
+        project_path: &Path,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let project = self.get_project(project_path).await?;
+        let response = serde_json::json!({
+            "project_path": resolve_project_path(project_path)?.display().to_string(),
+            "index": self.project_index_status(&project).await,
+        });
+        let content = json_content(response)?;
         Ok(CallToolResult::success(vec![content]))
     }
 
@@ -557,24 +918,127 @@ impl AppState {
         project_path: &Path,
     ) -> std::result::Result<CallToolResult, McpError> {
         let project = self.get_project(project_path).await?;
-        let project_guard = project.lock().await;
-        let raw_diagnostics = project_guard.diagnostics.lock().await.clone();
-        let outdated_dependencies = project_guard.outdated_dependencies.lock().await.clone();
-        let security_advisories = project_guard.security_advisories.lock().await.clone();
-        let cargo_warnings: Vec<_> = project_guard
-            .progress
-            .lock()
-            .await
-            .cargo_warnings
-            .clone();
+        let (
+            raw_diagnostics,
+            outdated_dependencies,
+            security_advisories,
+            cargo_warning_count,
+            index_status,
+        ) = {
+            let project_guard = project.lock().await;
+            let raw_diagnostics = project_guard.diagnostics.lock().await.clone();
+            let outdated_dependencies = project_guard.outdated_dependencies.lock().await.clone();
+            let security_advisories = project_guard.security_advisories.lock().await.clone();
+            let progress_guard = project_guard.progress.lock().await;
+            (
+                raw_diagnostics,
+                outdated_dependencies,
+                security_advisories,
+                progress_guard.cargo_warnings.len(),
+                progress_guard.to_json(),
+            )
+        };
         let build_diagnostics = diagnostics::summarize_diagnostics(&raw_diagnostics);
+        let outdated = diagnostics::summarize_outdated(&outdated_dependencies);
+        let advisories = diagnostics::summarize_audit(&security_advisories);
         let combined_report = serde_json::json!({
-            "build_diagnostics": build_diagnostics,
-            "outdated_dependencies": diagnostics::summarize_outdated(&outdated_dependencies),
-            "security_advisories": diagnostics::summarize_audit(&security_advisories),
-            "cargo_warnings": cargo_warnings,
+            "project_path": resolve_project_path(project_path)?.display().to_string(),
+            "index": index_status,
+            "build": summarize_build_levels(&build_diagnostics),
+            "outdated": {
+                "total": outdated.len(),
+            },
+            "security": {
+                "total": advisories.len(),
+            },
+            "cargo_warning_count": cargo_warning_count,
         });
         let content = Content::json(combined_report)?;
+        Ok(CallToolResult::success(vec![content]))
+    }
+
+    pub async fn get_build_diagnostics(
+        &self,
+        project_path: &Path,
+        limit: usize,
+        offset: usize,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let project = self.get_project(project_path).await?;
+        let project_guard = project.lock().await;
+        let raw_diagnostics = project_guard.diagnostics.lock().await.clone();
+        let build_diagnostics = diagnostics::summarize_diagnostics(&raw_diagnostics);
+        let total = build_diagnostics.len();
+        let page: Vec<_> = build_diagnostics
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+
+        let mut envelope = paginated_response(serde_json::json!(page), total, offset);
+        envelope["summary"] = summarize_build_levels(&build_diagnostics);
+        if let Some(message) = raw_diagnostics.iter().find_map(|v| {
+            (v.get("reason").and_then(|r| r.as_str()) == Some("cargo-check-error"))
+                .then(|| v.get("message").and_then(|m| m.as_str()))
+                .flatten()
+        }) {
+            envelope["error"] = tool_error_payload(
+                "CARGO_CHECK_FAILED",
+                "cargo check failed",
+                "build_diagnostics",
+                true,
+                &["Run cargo check locally for complete output"],
+                Some(project_path),
+                None,
+                Some(message),
+            );
+        }
+
+        let content = json_content(envelope)?;
+        Ok(CallToolResult::success(vec![content]))
+    }
+
+    pub async fn get_outdated_diagnostics(
+        &self,
+        project_path: &Path,
+        limit: usize,
+        offset: usize,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let project = self.get_project(project_path).await?;
+        let project_guard = project.lock().await;
+        let raw = project_guard.outdated_dependencies.lock().await.clone();
+        let items = diagnostics::summarize_outdated(&raw);
+        let total = items.len();
+        let page: Vec<_> = items.iter().skip(offset).take(limit).cloned().collect();
+
+        let mut envelope = paginated_response(serde_json::json!(page), total, offset);
+        envelope["summary"] = serde_json::json!({ "total": total });
+        if let Some(err) = normalize_tool_error(&raw, "outdated_diagnostics") {
+            envelope["error"] = err;
+        }
+        let content = json_content(envelope)?;
+        Ok(CallToolResult::success(vec![content]))
+    }
+
+    pub async fn get_security_diagnostics(
+        &self,
+        project_path: &Path,
+        limit: usize,
+        offset: usize,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let project = self.get_project(project_path).await?;
+        let project_guard = project.lock().await;
+        let raw = project_guard.security_advisories.lock().await.clone();
+        let items = diagnostics::summarize_audit(&raw);
+        let total = items.len();
+        let page: Vec<_> = items.iter().skip(offset).take(limit).cloned().collect();
+
+        let mut envelope = paginated_response(serde_json::json!(page), total, offset);
+        envelope["summary"] = serde_json::json!({ "total": total });
+        if let Some(err) = normalize_tool_error(&raw, "security_diagnostics") {
+            envelope["error"] = err;
+        }
+        let content = json_content(envelope)?;
         Ok(CallToolResult::success(vec![content]))
     }
 
@@ -583,17 +1047,16 @@ impl AppState {
         project_path: Option<&Path>,
         query: String,
         filter_crates: Option<Vec<String>>,
+        filter_kinds: Option<Vec<String>>,
+        mode: QueryMode,
         limit: usize,
         offset: usize,
     ) -> std::result::Result<CallToolResult, McpError> {
-        let query = query.trim().to_string();
-        if query.is_empty() {
-            return Err(McpError::invalid_params("query must not be empty", None));
-        }
+        let fts_query = build_fts_query(&query, mode)?;
 
         // When project_path is given, scope results to that project's dependency tree
         let mut is_partial = false;
-        let mut indexing_progress: Option<serde_json::Value> = None;
+        let mut indexing_status: Option<serde_json::Value> = None;
         let scope_crates: Option<Vec<docs::ProjectCrate>> = if let Some(pp) = project_path {
             let project = self.get_project(pp).await?;
             let project_guard = project.lock().await;
@@ -601,21 +1064,34 @@ impl AppState {
             let progress_guard = project_guard.progress.lock().await;
             match &progress_guard.phase {
                 Phase::Metadata | Phase::Check => {
-                    let phase = progress_guard.phase.as_str();
                     let snapshot = progress_guard.to_json();
-                    drop(progress_guard);
-                    let reason = format!(
-                        "Documentation index is not ready (phase: {phase}). Current progress: {snapshot}"
-                    );
-                    return Err(McpError::internal_error(reason, None));
+                    let snapshot_raw = snapshot.to_string();
+                    return Err(internal_tool_error(
+                        "INDEX_NOT_READY",
+                        "documentation index is not ready",
+                        "search_docs",
+                        true,
+                        &["Call get_index_status and wait for status=ready"],
+                        Some(pp),
+                        None,
+                        Some(&snapshot_raw),
+                    ));
                 }
                 Phase::Failed(msg) => {
-                    let reason = format!("Documentation indexing failed: {msg}");
-                    return Err(McpError::internal_error(reason, None));
+                    return Err(internal_tool_error(
+                        "INDEX_FAILED",
+                        "documentation indexing failed",
+                        "search_docs",
+                        false,
+                        &["Call reindex_project to retry indexing"],
+                        Some(pp),
+                        None,
+                        Some(msg),
+                    ));
                 }
                 Phase::Indexing => {
                     is_partial = true;
-                    indexing_progress = Some(progress_guard.to_json());
+                    indexing_status = Some(progress_guard.to_json());
                 }
                 Phase::Ready => {}
             }
@@ -645,7 +1121,7 @@ impl AppState {
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql + Send>> = Vec::new();
 
         // ?1 = query
-        param_values.push(Box::new(query.clone()));
+        param_values.push(Box::new(fts_query));
 
         let mut extra_where = String::new();
 
@@ -681,7 +1157,20 @@ impl AppState {
                 placeholders.join(", ")
             ));
             for f in filters {
-                param_values.push(Box::new(f.clone()));
+                param_values.push(Box::new(docs::normalize_crate_name(f)));
+            }
+        }
+
+        if let Some(filters) = filter_kinds.as_ref()
+            && !filters.is_empty()
+        {
+            let mut placeholders = Vec::with_capacity(filters.len());
+            for i in 0..filters.len() {
+                placeholders.push(format!("?{}", param_values.len() + 1 + i));
+            }
+            extra_where.push_str(&format!(" AND d.kind IN ({})", placeholders.join(", ")));
+            for kind in filters {
+                param_values.push(Box::new(kind.clone()));
             }
         }
 
@@ -708,7 +1197,7 @@ impl AppState {
             "#
         );
 
-        let all_results = self
+        let all_results = match self
             .db
             .call(move |conn| {
                 let mut stmt = conn.prepare(&sql)?;
@@ -735,7 +1224,37 @@ impl AppState {
                 Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             })
             .await
-            .mcp_internal_err("Failed to query docs")?;
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                let err_text = e.to_string();
+                if err_text.contains("fts5")
+                    || err_text.contains("no such column")
+                    || err_text.contains("syntax error")
+                {
+                    return Err(invalid_tool_error(
+                        "INVALID_SEARCH_QUERY",
+                        "search query could not be parsed",
+                        "search_docs",
+                        false,
+                        &["Use words or symbol paths like tokio::spawn"],
+                        project_path,
+                        None,
+                        Some(&err_text),
+                    ));
+                }
+                return Err(internal_tool_error(
+                    "SEARCH_QUERY_FAILED",
+                    "search query failed",
+                    "search_docs",
+                    true,
+                    &["Retry the request"],
+                    project_path,
+                    None,
+                    Some(&err_text),
+                ));
+            }
+        };
 
         let total = all_results.len();
         let page: Vec<_> = all_results.into_iter().skip(offset).take(limit).collect();
@@ -743,16 +1262,15 @@ impl AppState {
 
         if is_partial {
             envelope["partial"] = serde_json::json!(true);
-            if let Some(progress) = indexing_progress {
-                envelope["indexing_progress"] = progress;
+            if let Some(status) = indexing_status {
+                envelope["index"] = status;
             }
         }
 
-        // Issue 5: explain zero results when project-scoped
         if total == 0 && project_path.is_some() {
             let mut notes = Vec::new();
             if is_partial {
-                notes.push("Indexing is still in progress — not all crates are searchable yet".to_string());
+                notes.push("index is still building; results may be incomplete".to_string());
             }
             if let Some(pp) = project_path {
                 if let Ok(project) = self.get_project(pp).await {
@@ -760,9 +1278,7 @@ impl AppState {
                     let progress_guard = pg.progress.lock().await;
                     let failed = progress_guard.failed_count;
                     if failed > 0 {
-                        notes.push(format!(
-                            "{failed} crates failed indexing (see list_projects for details)"
-                        ));
+                        notes.push(format!("{failed} crates failed indexing"));
                     }
                 }
             }
@@ -788,7 +1304,6 @@ impl AppState {
 
         match removed {
             Some(project) => {
-                // Abort all background tasks (watcher, check, docs, outdated, audit)
                 let guard = project.lock().await;
                 if let Some(tx) = &guard.abort {
                     let _ = tx.send(());
@@ -802,8 +1317,14 @@ impl AppState {
                 }))?;
                 Ok(CallToolResult::success(vec![content]))
             }
-            None => Err(McpError::invalid_params(
-                format!("Project not registered: {}", canonical.display()),
+            None => Err(invalid_tool_error(
+                "PROJECT_NOT_REGISTERED",
+                "project is not registered",
+                "unregister_project",
+                false,
+                &[],
+                Some(&canonical),
+                None,
                 None,
             )),
         }
@@ -820,7 +1341,16 @@ fn extract_project_path(
         .and_then(|a| a.get("project_path"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            McpError::invalid_params("Missing required 'project_path' parameter", None)
+            invalid_tool_error(
+                "MISSING_PROJECT_PATH",
+                "missing required project_path parameter",
+                "tool_input",
+                false,
+                &[],
+                None,
+                None,
+                None,
+            )
         })?;
     Ok(PathBuf::from(path_str))
 }
@@ -836,9 +1366,15 @@ fn try_extract_project_path(
 
 fn resolve_project_path(path: &Path) -> Result<PathBuf, McpError> {
     path.canonicalize().map_err(|e| {
-        McpError::invalid_params(
-            format!("Cannot resolve project path '{}': {}", path.display(), e),
+        invalid_tool_error(
+            "INVALID_PROJECT_PATH",
+            "cannot resolve project path",
+            "path_resolution",
+            false,
+            &["Provide an existing absolute project path"],
+            Some(path),
             None,
+            Some(&e.to_string()),
         )
     })
 }
@@ -864,16 +1400,10 @@ impl ServerHandler for AppState {
                 website_url: None,
             },
             instructions: Some(
-                "Rust toolchain MCP server. \
-                 Register a project first with register_project — this starts background \
-                 indexing of rustdoc JSON for all dependencies. The response includes \
-                 dependency counts and an estimated indexing time. Use list_projects to check \
-                 phase and progress (metadata -> check -> indexing -> ready). Once in the \
-                 ready phase, search_docs provides full-text search across \
-                 all project dependencies. list_crates shows workspace crates. get_diagnostics \
-                 returns build errors, outdated dependencies, and security advisories. \
-                 Resources: cratedex://logs for server logs. \
-                 Prompts: coding_modern_rust (modern Rust guide with optional code review)."
+                "Register projects, monitor index status, query docs, and fetch diagnostics. \
+                 Use register_project once, reindex_project only when you want to refresh. \
+                 Diagnostics are split by intent for small payloads. \
+                 Resources: cratedex://logs. Prompt: coding_modern_rust."
                     .to_string(),
             ),
         }
@@ -895,14 +1425,47 @@ impl ServerHandler for AppState {
                         .and_then(|args| args.get("project_path"))
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| {
-                            McpError::invalid_params("Missing 'project_path' parameter", None)
+                            invalid_tool_error(
+                                "MISSING_PROJECT_PATH",
+                                "missing project_path parameter",
+                                "register_project",
+                                false,
+                                &[],
+                                None,
+                                None,
+                                None,
+                            )
                         })?;
                     self.register_project(path_str).await
+                }
+                "reindex_project" => {
+                    let path_str = call
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("project_path"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            invalid_tool_error(
+                                "MISSING_PROJECT_PATH",
+                                "missing project_path parameter",
+                                "reindex_project",
+                                false,
+                                &[],
+                                None,
+                                None,
+                                None,
+                            )
+                        })?;
+                    self.reindex_project(path_str).await
                 }
                 "list_projects" => {
                     let (limit, offset) =
                         extract_pagination(&call.arguments, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
                     self.list_projects(limit, offset).await
+                }
+                "get_index_status" => {
+                    let path = extract_project_path(&call.arguments)?;
+                    self.get_index_status(&path).await
                 }
                 "list_crates" => {
                     let path = extract_project_path(&call.arguments)?;
@@ -914,6 +1477,24 @@ impl ServerHandler for AppState {
                     let path = extract_project_path(&call.arguments)?;
                     self.get_diagnostics(&path).await
                 }
+                "get_build_diagnostics" => {
+                    let path = extract_project_path(&call.arguments)?;
+                    let (limit, offset) =
+                        extract_pagination(&call.arguments, DEFAULT_DETAIL_LIMIT, MAX_DETAIL_LIMIT);
+                    self.get_build_diagnostics(&path, limit, offset).await
+                }
+                "get_outdated_diagnostics" => {
+                    let path = extract_project_path(&call.arguments)?;
+                    let (limit, offset) =
+                        extract_pagination(&call.arguments, DEFAULT_DETAIL_LIMIT, MAX_DETAIL_LIMIT);
+                    self.get_outdated_diagnostics(&path, limit, offset).await
+                }
+                "get_security_diagnostics" => {
+                    let path = extract_project_path(&call.arguments)?;
+                    let (limit, offset) =
+                        extract_pagination(&call.arguments, DEFAULT_DETAIL_LIMIT, MAX_DETAIL_LIMIT);
+                    self.get_security_diagnostics(&path, limit, offset).await
+                }
                 "search_docs" => {
                     let project_path = try_extract_project_path(&call.arguments);
                     let query = call
@@ -921,7 +1502,18 @@ impl ServerHandler for AppState {
                         .as_ref()
                         .and_then(|args| args.get("query"))
                         .and_then(|v| v.as_str())
-                        .ok_or_else(|| McpError::invalid_params("Missing 'query' parameter", None))?
+                        .ok_or_else(|| {
+                            invalid_tool_error(
+                                "MISSING_QUERY",
+                                "missing query parameter",
+                                "search_docs",
+                                false,
+                                &[],
+                                None,
+                                None,
+                                None,
+                            )
+                        })?
                         .to_string();
                     let filter_crates = call
                         .arguments
@@ -933,11 +1525,35 @@ impl ServerHandler for AppState {
                                 .filter_map(|v| v.as_str().map(String::from))
                                 .collect::<Vec<String>>()
                         });
+                    let filter_kinds = call
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("kinds"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect::<Vec<String>>()
+                        });
+                    let mode = QueryMode::parse(
+                        call.arguments
+                            .as_ref()
+                            .and_then(|args| args.get("mode"))
+                            .and_then(|v| v.as_str()),
+                    )?;
                     let search_limit_cap = self.config.server.max_search_results.max(1);
                     let (limit, offset) =
                         extract_pagination(&call.arguments, search_limit_cap, search_limit_cap);
-                    self.search_docs(project_path.as_deref(), query, filter_crates, limit, offset)
-                        .await
+                    self.search_docs(
+                        project_path.as_deref(),
+                        query,
+                        filter_crates,
+                        filter_kinds,
+                        mode,
+                        limit,
+                        offset,
+                    )
+                    .await
                 }
                 "unregister_project" => {
                     let path_str = call
@@ -946,7 +1562,16 @@ impl ServerHandler for AppState {
                         .and_then(|args| args.get("project_path"))
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| {
-                            McpError::invalid_params("Missing 'project_path' parameter", None)
+                            invalid_tool_error(
+                                "MISSING_PROJECT_PATH",
+                                "missing project_path parameter",
+                                "unregister_project",
+                                false,
+                                &[],
+                                None,
+                                None,
+                                None,
+                            )
                         })?;
                     self.unregister_project(path_str).await
                 }
@@ -965,30 +1590,27 @@ impl ServerHandler for AppState {
             info!("list_tools requested");
             let project_path_prop = serde_json::json!({
                 "type": "string",
-                "description": "Absolute path to the Rust project directory"
+                "description": "Absolute Rust project path"
             });
             let pagination_props = serde_json::json!({
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results to return (default: 50, max: 200)"
+                    "description": "Page size"
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Number of results to skip for pagination (default: 0)"
+                    "description": "Pagination offset"
                 }
             });
             let search_limit_cap = self.config.server.max_search_results.max(1);
             let search_pagination_props = serde_json::json!({
                 "limit": {
                     "type": "integer",
-                    "description": format!(
-                        "Maximum number of results to return (default: {}, max: {}, controlled by server.max_search_results)",
-                        search_limit_cap, search_limit_cap
-                    )
+                    "description": format!("Page size (max {search_limit_cap})")
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Number of results to skip for pagination (default: 0)"
+                    "description": "Pagination offset"
                 }
             });
             let paginated_output_schema = |items_schema: serde_json::Value| -> Option<
@@ -997,11 +1619,11 @@ impl ServerHandler for AppState {
                 serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "total": { "type": "integer", "description": "Total number of results available" },
-                        "count": { "type": "integer", "description": "Number of results in this page" },
-                        "offset": { "type": "integer", "description": "Offset used for this page" },
-                        "has_more": { "type": "boolean", "description": "Whether more results are available" },
-                        "next_offset": { "type": ["integer", "null"], "description": "Offset for the next page, or null if no more results" },
+                        "total": { "type": "integer" },
+                        "count": { "type": "integer" },
+                        "offset": { "type": "integer" },
+                        "has_more": { "type": "boolean" },
+                        "next_offset": { "type": ["integer", "null"] },
                         "items": items_schema,
                     },
                     "required": ["total", "count", "offset", "has_more", "next_offset", "items"]
@@ -1015,10 +1637,8 @@ impl ServerHandler for AppState {
                 tools: vec![
                     rmcp::model::Tool {
                         name: "register_project".into(),
-                        title: Some("Register Rust Project".into()),
-                        description: Some(
-                            "Register a Rust project for indexing and diagnostics".into(),
-                        ),
+                        title: Some("Register Project".into()),
+                        description: Some("Register project and start background indexing".into()),
                         input_schema: Arc::new(
                             serde_json::json!({
                                 "type": "object",
@@ -1036,11 +1656,7 @@ impl ServerHandler for AppState {
                             "properties": {
                                 "status": { "type": "string" },
                                 "project_path": { "type": "string" },
-                                "phase": { "type": "string" },
-                                "total": { "type": "integer" },
-                                "new_dependencies": { "type": "integer" },
-                                "already_indexed": { "type": "integer" },
-                                "estimated_remaining_secs": { "type": ["number", "null"] }
+                                "index": { "type": "object" }
                             },
                             "required": ["status", "project_path"]
                         })
@@ -1057,11 +1673,46 @@ impl ServerHandler for AppState {
                         meta: None,
                     },
                     rmcp::model::Tool {
-                        name: "list_projects".into(),
-                        title: Some("List Registered Projects".into()),
-                        description: Some(
-                            "List all registered projects and their indexing status".into(),
+                        name: "reindex_project".into(),
+                        title: Some("Reindex Project".into()),
+                        description: Some("Restart indexing for an existing project".into()),
+                        input_schema: Arc::new(
+                            serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "project_path": &project_path_prop
+                                },
+                                "required": ["project_path"]
+                            })
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
                         ),
+                        output_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "status": { "type": "string" },
+                                "project_path": { "type": "string" },
+                                "index": { "type": "object" }
+                            },
+                            "required": ["status", "project_path"]
+                        })
+                        .as_object()
+                        .cloned()
+                        .map(Arc::new),
+                        annotations: Some(ToolAnnotations::new()
+                            .read_only(false)
+                            .destructive(false)
+                            .idempotent(false)
+                            .open_world(true)),
+                        execution: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    rmcp::model::Tool {
+                        name: "list_projects".into(),
+                        title: Some("List Projects".into()),
+                        description: Some("List registered projects".into()),
                         input_schema: Arc::new(
                             serde_json::json!({
                                 "type": "object",
@@ -1080,14 +1731,11 @@ impl ServerHandler for AppState {
                                 "type": "object",
                                 "properties": {
                                     "project_path": { "type": "string" },
-                                    "phase": { "type": "string" },
+                                    "status": { "type": "string" },
                                     "processed": { "type": "integer" },
-                                    "failed": { "type": "integer" },
                                     "total": { "type": "integer" },
-                                    "estimated_remaining_secs": { "type": ["number", "null"] },
-                                    "cargo_warning_count": { "type": "integer" },
-                                    "indexing_failures": { "type": ["object", "null"] },
-                                    "diagnostics_count": { "type": "integer" }
+                                    "percent": { "type": "integer" },
+                                    "eta_secs": { "type": ["number", "null"] }
                                 }
                             }
                         })),
@@ -1101,11 +1749,45 @@ impl ServerHandler for AppState {
                         meta: None,
                     },
                     rmcp::model::Tool {
-                        name: "list_crates".into(),
-                        title: Some("List Project Crates".into()),
-                        description: Some(
-                            "List all crates in the workspace of a registered project".into(),
+                        name: "get_index_status".into(),
+                        title: Some("Get Index Status".into()),
+                        description: Some("Get indexing status for one project".into()),
+                        input_schema: Arc::new(
+                            serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "project_path": &project_path_prop
+                                },
+                                "required": ["project_path"]
+                            })
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
                         ),
+                        output_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "project_path": { "type": "string" },
+                                "index": { "type": "object" }
+                            },
+                            "required": ["project_path", "index"]
+                        })
+                        .as_object()
+                        .cloned()
+                        .map(Arc::new),
+                        annotations: Some(ToolAnnotations::new()
+                            .read_only(true)
+                            .destructive(false)
+                            .idempotent(true)
+                            .open_world(false)),
+                        execution: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    rmcp::model::Tool {
+                        name: "list_crates".into(),
+                        title: Some("List Crates".into()),
+                        description: Some("List workspace crates".into()),
                         input_schema: Arc::new(
                             serde_json::json!({
                                 "type": "object",
@@ -1135,8 +1817,8 @@ impl ServerHandler for AppState {
                     },
                     rmcp::model::Tool {
                         name: "get_diagnostics".into(),
-                        title: Some("Get Project Diagnostics".into()),
-                        description: Some("Get build diagnostics, outdated dependencies, and security advisories for a registered project".into()),
+                        title: Some("Get Diagnostics Summary".into()),
+                        description: Some("Compact diagnostics summary".into()),
                         input_schema: Arc::new(
                             serde_json::json!({
                                 "type": "object",
@@ -1152,22 +1834,14 @@ impl ServerHandler for AppState {
                         output_schema: serde_json::json!({
                             "type": "object",
                             "properties": {
-                                "build_diagnostics": { "type": "array", "items": { "type": "object" } },
-                                "outdated_dependencies": { "type": "array", "items": { "type": "object" } },
-                                "security_advisories": { "type": "array", "items": { "type": "object" } },
-                                "cargo_warnings": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "source": { "type": "string" },
-                                            "message": { "type": "string" },
-                                            "count": { "type": "integer" }
-                                        }
-                                    }
-                                }
+                                "project_path": { "type": "string" },
+                                "index": { "type": "object" },
+                                "build": { "type": "object" },
+                                "outdated": { "type": "object" },
+                                "security": { "type": "object" },
+                                "cargo_warning_count": { "type": "integer" }
                             },
-                            "required": ["build_diagnostics", "outdated_dependencies", "security_advisories", "cargo_warnings"]
+                            "required": ["project_path", "index", "build", "outdated", "security", "cargo_warning_count"]
                         })
                         .as_object()
                         .cloned()
@@ -1182,29 +1856,132 @@ impl ServerHandler for AppState {
                         meta: None,
                     },
                     rmcp::model::Tool {
-                        name: "search_docs".into(),
-                        title: Some("Search Documentation".into()),
-                        description: Some(
-                            "Search Rust documentation across the global index. Optionally scope to a registered project's dependency tree.".into(),
+                        name: "get_build_diagnostics".into(),
+                        title: Some("Build Diagnostics".into()),
+                        description: Some("Paginated build diagnostics".into()),
+                        input_schema: Arc::new(
+                            serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "project_path": &project_path_prop,
+                                    "limit": pagination_props["limit"],
+                                    "offset": pagination_props["offset"],
+                                },
+                                "required": ["project_path"]
+                            })
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
                         ),
+                        output_schema: paginated_output_schema(serde_json::json!({
+                            "type": "array",
+                            "items": { "type": "object" }
+                        })),
+                        annotations: Some(ToolAnnotations::new()
+                            .read_only(true)
+                            .destructive(false)
+                            .idempotent(true)
+                            .open_world(false)),
+                        execution: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    rmcp::model::Tool {
+                        name: "get_outdated_diagnostics".into(),
+                        title: Some("Outdated Diagnostics".into()),
+                        description: Some("Paginated outdated dependencies".into()),
+                        input_schema: Arc::new(
+                            serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "project_path": &project_path_prop,
+                                    "limit": pagination_props["limit"],
+                                    "offset": pagination_props["offset"],
+                                },
+                                "required": ["project_path"]
+                            })
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
+                        ),
+                        output_schema: paginated_output_schema(serde_json::json!({
+                            "type": "array",
+                            "items": { "type": "object" }
+                        })),
+                        annotations: Some(ToolAnnotations::new()
+                            .read_only(true)
+                            .destructive(false)
+                            .idempotent(true)
+                            .open_world(false)),
+                        execution: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    rmcp::model::Tool {
+                        name: "get_security_diagnostics".into(),
+                        title: Some("Security Diagnostics".into()),
+                        description: Some("Paginated security advisories".into()),
+                        input_schema: Arc::new(
+                            serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "project_path": &project_path_prop,
+                                    "limit": pagination_props["limit"],
+                                    "offset": pagination_props["offset"],
+                                },
+                                "required": ["project_path"]
+                            })
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
+                        ),
+                        output_schema: paginated_output_schema(serde_json::json!({
+                            "type": "array",
+                            "items": { "type": "object" }
+                        })),
+                        annotations: Some(ToolAnnotations::new()
+                            .read_only(true)
+                            .destructive(false)
+                            .idempotent(true)
+                            .open_world(false)),
+                        execution: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    rmcp::model::Tool {
+                        name: "search_docs".into(),
+                        title: Some("Search Docs".into()),
+                        description: Some("Search indexed Rust documentation".into()),
                         input_schema: Arc::new(
                             serde_json::json!({
                                 "type": "object",
                                 "properties": {
                                     "project_path": {
                                         "type": "string",
-                                        "description": "Optional. Absolute path to a registered project. When provided, results are scoped to that project's dependency tree."
+                                        "description": "Optional project scope"
                                     },
                                     "query": {
                                         "type": "string",
-                                        "description": "The search query"
+                                        "description": "Search query"
                                     },
                                     "crates": {
                                         "type": "array",
                                         "items": {
                                             "type": "string"
                                         },
-                                        "description": "Optional list of crate names to filter the search"
+                                        "description": "Optional crate filters"
+                                    },
+                                    "kinds": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        },
+                                        "description": "Optional kind filters"
+                                    },
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["auto", "text", "symbol"],
+                                        "description": "Query parser mode"
                                     },
                                     "limit": search_pagination_props["limit"],
                                     "offset": search_pagination_props["offset"],
@@ -1240,10 +2017,8 @@ impl ServerHandler for AppState {
                     },
                     rmcp::model::Tool {
                         name: "unregister_project".into(),
-                        title: Some("Unregister Rust Project".into()),
-                        description: Some(
-                            "Remove a registered project from the server. Stops the file watcher and cleans up project state.".into(),
-                        ),
+                        title: Some("Unregister Project".into()),
+                        description: Some("Remove a registered project".into()),
                         input_schema: Arc::new(
                             serde_json::json!({
                                 "type": "object",
@@ -1612,7 +2387,6 @@ mod tests {
     use super::*;
     use crate::db::Db;
     use crate::engine::docs;
-    use rmcp::ServerHandler;
     use rusqlite::params;
 
     const INSERT_SQL: &str = r#"INSERT INTO "docs" (crate_name, crate_version, package_id_hash, item_name, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#;
@@ -1633,17 +2407,6 @@ mod tests {
         Arc::new(Mutex::new(progress))
     }
 
-    // ───── Phase::as_str tests ─────
-
-    #[test]
-    fn phase_as_str_returns_expected_values() {
-        assert_eq!(Phase::Metadata.as_str(), "metadata");
-        assert_eq!(Phase::Check.as_str(), "check");
-        assert_eq!(Phase::Indexing.as_str(), "indexing");
-        assert_eq!(Phase::Ready.as_str(), "ready");
-        assert_eq!(Phase::Failed("boom".into()).as_str(), "failed");
-    }
-
     // ───── merge_cargo_warnings tests ─────
 
     #[test]
@@ -1654,37 +2417,18 @@ mod tests {
             ("cargo check".into(), "warning: unused import".into()),
             ("cargo check".into(), "warning: unused import".into()),
             ("cargo check".into(), "error: type mismatch".into()),
+            // same message but different source — should NOT collapse
+            ("cargo rustdoc".into(), "warning: unused import".into()),
         ]);
 
-        assert_eq!(progress.cargo_warnings.len(), 2);
+        assert_eq!(progress.cargo_warnings.len(), 3);
 
         let unused = progress
             .cargo_warnings
             .iter()
-            .find(|w| w.message == "warning: unused import")
+            .find(|w| w.message == "warning: unused import" && w.source == "cargo check")
             .unwrap();
         assert_eq!(unused.count, 2);
-        assert_eq!(unused.source, "cargo check");
-
-        let mismatch = progress
-            .cargo_warnings
-            .iter()
-            .find(|w| w.message == "error: type mismatch")
-            .unwrap();
-        assert_eq!(mismatch.count, 1);
-    }
-
-    #[test]
-    fn merge_cargo_warnings_distinguishes_sources() {
-        let mut progress = ProjectProgress::new();
-
-        progress.merge_cargo_warnings(vec![
-            ("cargo check".into(), "warning: unused import".into()),
-            ("cargo rustdoc".into(), "warning: unused import".into()),
-        ]);
-
-        // Same message but different sources — should remain as two separate entries
-        assert_eq!(progress.cargo_warnings.len(), 2);
     }
 
     // ───── to_json tests ─────
@@ -1695,26 +2439,31 @@ mod tests {
         progress.estimated_total_secs = Some(100.0);
         progress.new_dependencies = 10;
 
-        // During Metadata phase, estimated_remaining_secs should be null
+        // During Metadata phase, eta_secs should be null
         progress.phase = Phase::Metadata;
         let json = progress.to_json();
-        assert!(json["estimated_remaining_secs"].is_null());
+        assert!(json["eta_secs"].is_null());
+        assert_eq!(json["status"], "queued");
 
-        // During Check phase, estimated_remaining_secs should be null
+        // During Check phase, eta_secs should be null
         progress.phase = Phase::Check;
         let json = progress.to_json();
-        assert!(json["estimated_remaining_secs"].is_null());
+        assert!(json["eta_secs"].is_null());
+        assert_eq!(json["status"], "queued");
 
-        // During Indexing phase with remaining work, estimated_remaining_secs should be a number
+        // During Indexing phase with remaining work, eta_secs should be a number
         progress.phase = Phase::Indexing;
         let json = progress.to_json();
-        assert!(json["estimated_remaining_secs"].is_number());
+        assert!(json["eta_secs"].is_number());
+        assert_eq!(json["status"], "indexing");
 
         // When all crates are done but still in Indexing phase (Phase 2), should be null
         progress.processed_count = 8;
         progress.failed_count = 2;
         let json = progress.to_json();
-        assert!(json["estimated_remaining_secs"].is_null());
+        assert!(json["eta_secs"].is_null());
+        assert_eq!(json["processed"], 10);
+        assert_eq!(json["total"], 10);
     }
 
     /// Helper to extract the JSON text from a CallToolResult's first content item.
@@ -1758,24 +2507,6 @@ mod tests {
         .unwrap();
     }
 
-    // ───── get_info tests ─────
-
-    #[test]
-    fn get_info_returns_correct_metadata() {
-        let db = Db::open(":memory:").unwrap();
-        let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
-        let info = app_state.get_info();
-
-        assert_eq!(info.server_info.name, "cratedex");
-        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.server_info.title.as_deref(), Some("Cratedex"));
-        assert!(info.instructions.is_some());
-        assert!(
-            info.capabilities.tools.is_some(),
-            "tools capability should be enabled"
-        );
-    }
-
     // ───── search_docs tests ─────
 
     #[tokio::test]
@@ -1802,7 +2533,15 @@ mod tests {
 
         let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
         let result = app_state
-            .search_docs(None, "task".to_string(), None, DEFAULT_PAGE_LIMIT, 0)
+            .search_docs(
+                None,
+                "task".to_string(),
+                None,
+                None,
+                QueryMode::Auto,
+                DEFAULT_PAGE_LIMIT,
+                0,
+            )
             .await
             .unwrap();
 
@@ -1815,16 +2554,6 @@ mod tests {
             items.iter().any(|r| r["crate"] == "tokio"),
             "Should find tokio for 'task'"
         );
-    }
-
-    #[tokio::test]
-    async fn search_docs_rejects_empty_query() {
-        let db = setup_db();
-        let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
-        let result = app_state
-            .search_docs(None, "".to_string(), None, DEFAULT_PAGE_LIMIT, 0)
-            .await;
-        assert!(result.is_err(), "Empty query should be rejected");
     }
 
     #[tokio::test]
@@ -1855,6 +2584,8 @@ mod tests {
                 None,
                 "task".to_string(),
                 Some(vec!["serde".to_string()]),
+                None,
+                QueryMode::Auto,
                 DEFAULT_PAGE_LIMIT,
                 0,
             )
@@ -1868,145 +2599,6 @@ mod tests {
                 "Crate filter should restrict results to serde only"
             );
         }
-    }
-
-    // ───── Pagination tests ─────
-
-    #[test]
-    fn extract_pagination_respects_custom_limits() {
-        let args: Option<serde_json::Map<String, serde_json::Value>> = None;
-        assert_eq!(extract_pagination(&args, 7, 7), (7, 0));
-
-        let mut args = serde_json::Map::new();
-        args.insert("limit".to_string(), serde_json::json!(99));
-        args.insert("offset".to_string(), serde_json::json!(4));
-        assert_eq!(extract_pagination(&Some(args), 7, 7), (7, 4));
-    }
-
-    #[tokio::test]
-    async fn search_docs_pagination_respects_limit() {
-        let db = setup_db();
-        for i in 0..5 {
-            insert_doc(
-                &db,
-                &format!("crate{}", i),
-                "1.0.0",
-                &format!("hash{}", i),
-                &format!("item{}", i),
-                "Function",
-                &format!("Does important stuff number {}", i),
-            );
-        }
-
-        let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
-        let result = app_state
-            .search_docs(None, "stuff".to_string(), None, 2, 0)
-            .await
-            .unwrap();
-
-        let envelope = extract_envelope(&result);
-        assert_eq!(envelope["count"], 2);
-        assert_eq!(envelope["total"], 5);
-        assert_eq!(envelope["has_more"], true);
-        assert_eq!(envelope["offset"], 0);
-        assert_eq!(envelope["next_offset"], 2);
-    }
-
-    #[tokio::test]
-    async fn search_docs_pagination_respects_offset() {
-        let db = setup_db();
-        for i in 0..5 {
-            insert_doc(
-                &db,
-                &format!("crate{}", i),
-                "1.0.0",
-                &format!("hash{}", i),
-                &format!("item{}", i),
-                "Function",
-                &format!("Does important stuff number {}", i),
-            );
-        }
-
-        let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
-        let page1 = app_state
-            .search_docs(None, "stuff".to_string(), None, 2, 0)
-            .await
-            .unwrap();
-        let page2 = app_state
-            .search_docs(None, "stuff".to_string(), None, 2, 2)
-            .await
-            .unwrap();
-
-        let items1 = extract_items(&page1);
-        let items2 = extract_items(&page2);
-        assert_eq!(items1.len(), 2);
-        assert_eq!(items2.len(), 2);
-        // Pages should contain different items
-        let names1: Vec<&str> = items1.iter().map(|r| r["item"].as_str().unwrap()).collect();
-        let names2: Vec<&str> = items2.iter().map(|r| r["item"].as_str().unwrap()).collect();
-        for name in &names2 {
-            assert!(
-                !names1.contains(name),
-                "Page 2 should contain different items than page 1"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn search_docs_pagination_last_page() {
-        let db = setup_db();
-        for i in 0..3 {
-            insert_doc(
-                &db,
-                &format!("crate{}", i),
-                "1.0.0",
-                &format!("hash{}", i),
-                &format!("item{}", i),
-                "Function",
-                &format!("Does important stuff number {}", i),
-            );
-        }
-
-        let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
-        let result = app_state
-            .search_docs(None, "stuff".to_string(), None, 50, 0)
-            .await
-            .unwrap();
-
-        let envelope = extract_envelope(&result);
-        assert_eq!(envelope["count"], 3);
-        assert_eq!(envelope["total"], 3);
-        assert_eq!(envelope["has_more"], false);
-        assert!(envelope["next_offset"].is_null());
-    }
-
-    #[tokio::test]
-    async fn pagination_offset_beyond_total() {
-        let db = setup_db();
-        insert_doc(
-            &db,
-            "mycrate",
-            "1.0.0",
-            "hash",
-            "myitem",
-            "Function",
-            "Does stuff",
-        );
-
-        let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
-        let result = app_state
-            .search_docs(None, "stuff".to_string(), None, 10, 100)
-            .await
-            .unwrap();
-
-        let envelope = extract_envelope(&result);
-        assert_eq!(
-            envelope["total"], 1,
-            "total should reflect all matching docs"
-        );
-        assert_eq!(envelope["count"], 0, "no items returned at this offset");
-        assert_eq!(envelope["has_more"], false);
-        assert!(envelope["next_offset"].is_null());
     }
 
     #[tokio::test]
@@ -2029,7 +2621,15 @@ mod tests {
         let app_state = AppState::new(cfg, db, resources::new_log_buffer(10));
 
         let first_page = app_state
-            .search_docs(None, "stuff".to_string(), None, 50, 0)
+            .search_docs(
+                None,
+                "stuff".to_string(),
+                None,
+                None,
+                QueryMode::Auto,
+                50,
+                0,
+            )
             .await
             .unwrap();
         let envelope = extract_envelope(&first_page);
@@ -2038,43 +2638,21 @@ mod tests {
         assert_eq!(envelope["has_more"], false);
 
         let after_cap = app_state
-            .search_docs(None, "stuff".to_string(), None, 50, 3)
+            .search_docs(
+                None,
+                "stuff".to_string(),
+                None,
+                None,
+                QueryMode::Auto,
+                50,
+                3,
+            )
             .await
             .unwrap();
         let envelope = extract_envelope(&after_cap);
         assert_eq!(envelope["total"], 3);
         assert_eq!(envelope["count"], 0);
         assert_eq!(envelope["has_more"], false);
-    }
-
-    #[tokio::test]
-    async fn list_crates_pagination() {
-        let db = setup_db();
-        let app_state = AppState::new(Config::default(), db, resources::new_log_buffer(10));
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().canonicalize().unwrap();
-
-        // Use synthetic metadata with 2 workspace packages
-        let meta = synthetic_metadata_multi_workspace();
-        let project_state = ProjectState {
-            project_path: canonical.clone(),
-            metadata: Arc::new(meta),
-            diagnostics: Arc::new(Mutex::new(Vec::new())),
-            outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
-            security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            progress: ready_progress(),
-            abort: None,
-        };
-        {
-            let mut registry = app_state.projects.write().await;
-            registry.insert(canonical.clone(), Arc::new(Mutex::new(project_state)));
-        }
-
-        let result = app_state.list_crates(&canonical, 1, 0).await.unwrap();
-        let envelope = extract_envelope(&result);
-        assert_eq!(envelope["total"], 2);
-        assert_eq!(envelope["count"], 1);
-        assert_eq!(envelope["has_more"], true);
     }
 
     /// Build a minimal cargo metadata with two packages (alpha, beta) where
@@ -2159,95 +2737,6 @@ mod tests {
             "workspace_root": "/test/alpha"
         }))
         .expect("synthetic metadata should deserialize")
-    }
-
-    /// Build metadata with two workspace members (alpha, beta) for pagination tests.
-    fn synthetic_metadata_multi_workspace() -> cargo_metadata::Metadata {
-        serde_json::from_value(serde_json::json!({
-            "packages": [
-                {
-                    "name": "alpha",
-                    "version": "0.1.0",
-                    "id": "alpha 0.1.0 (path+file:///test/alpha)",
-                    "source": null,
-                    "dependencies": [],
-                    "targets": [{"kind": ["lib"], "crate_types": ["lib"], "name": "alpha", "src_path": "/test/alpha/src/lib.rs", "edition": "2021", "doc": true, "doctest": true, "test": true}],
-                    "features": {},
-                    "manifest_path": "/test/alpha/Cargo.toml",
-                    "metadata": null,
-                    "publish": null,
-                    "authors": [],
-                    "categories": [],
-                    "keywords": [],
-                    "readme": null,
-                    "repository": null,
-                    "homepage": null,
-                    "documentation": null,
-                    "edition": "2021",
-                    "links": null,
-                    "default_run": null,
-                    "rust_version": null,
-                    "license": null,
-                    "license_file": null,
-                    "description": null
-                },
-                {
-                    "name": "beta",
-                    "version": "0.1.0",
-                    "id": "beta 0.1.0 (path+file:///test/beta)",
-                    "source": null,
-                    "dependencies": [],
-                    "targets": [{"kind": ["lib"], "crate_types": ["lib"], "name": "beta", "src_path": "/test/beta/src/lib.rs", "edition": "2021", "doc": true, "doctest": true, "test": true}],
-                    "features": {},
-                    "manifest_path": "/test/beta/Cargo.toml",
-                    "metadata": null,
-                    "publish": null,
-                    "authors": [],
-                    "categories": [],
-                    "keywords": [],
-                    "readme": null,
-                    "repository": null,
-                    "homepage": null,
-                    "documentation": null,
-                    "edition": "2021",
-                    "links": null,
-                    "default_run": null,
-                    "rust_version": null,
-                    "license": null,
-                    "license_file": null,
-                    "description": null
-                }
-            ],
-            "workspace_members": [
-                "alpha 0.1.0 (path+file:///test/alpha)",
-                "beta 0.1.0 (path+file:///test/beta)"
-            ],
-            "workspace_default_members": [
-                "alpha 0.1.0 (path+file:///test/alpha)",
-                "beta 0.1.0 (path+file:///test/beta)"
-            ],
-            "resolve": {
-                "nodes": [
-                    {
-                        "id": "alpha 0.1.0 (path+file:///test/alpha)",
-                        "dependencies": [],
-                        "deps": [],
-                        "features": []
-                    },
-                    {
-                        "id": "beta 0.1.0 (path+file:///test/beta)",
-                        "dependencies": [],
-                        "deps": [],
-                        "features": []
-                    }
-                ],
-                "root": null
-            },
-            "target_directory": "/test/target",
-            "version": 1,
-            "workspace_root": "/test"
-        }))
-        .expect("synthetic multi-workspace metadata should deserialize")
     }
 
     /// Build metadata with two workspace members in non-deterministic package order.
@@ -2516,6 +3005,8 @@ mod tests {
                 Some(&canonical),
                 "stuff".to_string(),
                 None,
+                None,
+                QueryMode::Auto,
                 DEFAULT_PAGE_LIMIT,
                 0,
             )
@@ -2599,23 +3090,42 @@ mod tests {
         let result_a = app_state.get_diagnostics(&path_a).await.unwrap();
         let report_a: serde_json::Value =
             serde_json::from_str(extract_json_text(&result_a)).unwrap();
-        assert_eq!(
-            report_a["build_diagnostics"][0]["message"],
-            "error in project A"
-        );
-        // outdated/audit are now summarized — raw values without proper structure return empty arrays
-        assert!(report_a["outdated_dependencies"].is_array());
-        assert!(report_a["security_advisories"].is_array());
+        assert_eq!(report_a["build"]["errors"], 1);
+        assert_eq!(report_a["build"]["warnings"], 0);
+        assert!(report_a["index"]["status"].is_string());
 
         // Verify project B diagnostics (different from A)
         let result_b = app_state.get_diagnostics(&path_b).await.unwrap();
         let report_b: serde_json::Value =
             serde_json::from_str(extract_json_text(&result_b)).unwrap();
-        assert_eq!(
-            report_b["build_diagnostics"][0]["message"],
-            "warning in project B"
-        );
-        assert!(report_b["outdated_dependencies"].is_array());
-        assert!(report_b["security_advisories"].is_array());
+        assert_eq!(report_b["build"]["errors"], 0);
+        assert_eq!(report_b["build"]["warnings"], 1);
+        assert!(report_b["index"]["status"].is_string());
+    }
+
+    // ───── FTS query building tests ─────
+
+    #[test]
+    fn search_tokens_splits_rust_symbols_and_preserves_underscores() {
+        assert_eq!(search_tokens("tokio::spawn"), vec!["tokio", "spawn"]);
+        assert_eq!(search_tokens("my_func"), vec!["my_func"]);
+        assert_eq!(search_tokens("a<T, U>"), vec!["a", "t", "u"]);
+    }
+
+    #[test]
+    fn build_fts_query_auto_mode_switches_on_colons() {
+        // `::` triggers symbol tokenization — the key heuristic
+        let q = build_fts_query("tokio::spawn", QueryMode::Auto).unwrap();
+        assert_eq!(q, "tokio* AND spawn*");
+
+        // no `::` stays as text — same tokenization, different detection path
+        let q = build_fts_query("async runtime", QueryMode::Auto).unwrap();
+        assert_eq!(q, "async* AND runtime*");
+    }
+
+    #[test]
+    fn build_fts_query_rejects_unsearchable_input() {
+        assert!(build_fts_query("", QueryMode::Auto).is_err());
+        assert!(build_fts_query(":: ::", QueryMode::Auto).is_err());
     }
 }

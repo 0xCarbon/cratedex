@@ -168,10 +168,7 @@ pub async fn ensure_docs_are_cached_and_indexed(
                 .unwrap_or("unknown generation failure")
                 .to_string();
             let mut progress_guard = progress.lock().await;
-            *progress_guard
-                .failure_categories
-                .entry(reason)
-                .or_insert(0) += 1;
+            *progress_guard.failure_categories.entry(reason).or_insert(0) += 1;
             progress_guard.failed_count += 1;
             continue;
         }

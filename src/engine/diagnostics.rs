@@ -3,8 +3,9 @@
 use crate::engine::command::{
     extract_cargo_warnings, new_cargo_command, run_with_timeout, stderr_preview,
 };
-use crate::engine::server::ProjectProgress;
+use crate::engine::server::{tool_error_payload, ProjectProgress};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,17 @@ use tracing::{error, info};
 const CHECK_TIMEOUT: Duration = Duration::from_mins(5);
 const OUTDATED_TIMEOUT: Duration = Duration::from_mins(2);
 const AUDIT_TIMEOUT: Duration = Duration::from_mins(2);
+
+fn command_error(
+    code: &str,
+    message: &str,
+    stage: &str,
+    retryable: bool,
+    hints: &[&str],
+    raw: Option<&str>,
+) -> Value {
+    tool_error_payload(code, message, stage, retryable, hints, None, None, raw)
+}
 
 fn parse_compiler_message_line(line: &str) -> Option<Value> {
     let json_value = serde_json::from_str::<Value>(line).ok()?;
@@ -107,8 +119,7 @@ pub fn summarize_audit(raw: &Value) -> Vec<Value> {
         return Vec::new();
     };
 
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut results = Vec::new();
+    let mut groups: BTreeMap<String, (Value, HashSet<String>)> = BTreeMap::new();
 
     for entry in list {
         let advisory = match entry.get("advisory") {
@@ -119,11 +130,6 @@ pub fn summarize_audit(raw: &Value) -> Vec<Value> {
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-
-        // Deduplicate by advisory ID
-        if !seen_ids.insert(id.to_string()) {
-            continue;
-        }
 
         let title = advisory
             .get("title")
@@ -150,22 +156,45 @@ pub fn summarize_audit(raw: &Value) -> Vec<Value> {
             .cloned()
             .unwrap_or(Value::Null);
 
-        let mut summary = serde_json::json!({
-            "id": id,
-            "title": title,
-            "crate": crate_name,
-            "installed_version": installed_version,
-            "patched_versions": patched_versions,
+        let (summary, seen_packages) = groups.entry(id.to_string()).or_insert_with(|| {
+            let mut base = serde_json::json!({
+                "id": id,
+                "title": title,
+                "patched_versions": patched_versions,
+                "affected_packages": [],
+            });
+            if let Some(sev) = severity {
+                if let Some(obj) = base.as_object_mut() {
+                    obj.insert("severity".into(), Value::String(sev.to_string()));
+                }
+            }
+            (base, HashSet::new())
         });
-        if let Some(sev) = severity {
-            summary
-                .as_object_mut()
-                .unwrap()
-                .insert("severity".into(), Value::String(sev.to_string()));
+
+        let package_key = format!("{crate_name}@{installed_version}");
+        if seen_packages.insert(package_key) {
+            if let Some(arr) = summary
+                .get_mut("affected_packages")
+                .and_then(|v| v.as_array_mut())
+            {
+                arr.push(serde_json::json!({
+                    "crate": crate_name,
+                    "installed_version": installed_version,
+                }));
+            }
         }
-        results.push(summary);
     }
 
+    let mut results = Vec::with_capacity(groups.len());
+    for (_, (mut summary, _)) in groups {
+        let affected_count = summary
+            .get("affected_packages")
+            .and_then(|v| v.as_array())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        summary["affected_count"] = serde_json::json!(affected_count);
+        results.push(summary);
+    }
     results
 }
 
@@ -251,7 +280,14 @@ pub async fn run_outdated_on_startup(
             );
             let mut cache = outdated_cache.lock().await;
             *cache = serde_json::json!({
-                "error": e.to_string(),
+                "error": command_error(
+                    "OUTDATED_EXEC_FAILED",
+                    "failed to execute cargo outdated",
+                    "outdated_diagnostics",
+                    true,
+                    &["Install cargo-outdated: cargo install cargo-outdated"],
+                    Some(&e.to_string()),
+                ),
             });
             return;
         }
@@ -266,7 +302,14 @@ pub async fn run_outdated_on_startup(
         error!("`cargo outdated` command failed: {}", err);
         let mut cache = outdated_cache.lock().await;
         *cache = serde_json::json!({
-            "error": err,
+            "error": command_error(
+                "OUTDATED_COMMAND_FAILED",
+                "cargo outdated returned a non-zero exit code",
+                "outdated_diagnostics",
+                true,
+                &[],
+                Some(&err),
+            ),
         });
         return;
     }
@@ -277,7 +320,14 @@ pub async fn run_outdated_on_startup(
             error!("Failed to parse `cargo outdated` JSON output: {}", e);
             let mut cache = outdated_cache.lock().await;
             *cache = serde_json::json!({
-                "error": e.to_string(),
+                "error": command_error(
+                    "OUTDATED_PARSE_FAILED",
+                    "failed to parse cargo outdated output",
+                    "outdated_diagnostics",
+                    true,
+                    &["Retry after updating cargo-outdated"],
+                    Some(&e.to_string()),
+                ),
             });
             return;
         }
@@ -309,7 +359,14 @@ pub async fn run_audit_on_startup(
             );
             let mut cache = audit_cache.lock().await;
             *cache = serde_json::json!({
-                "error": e.to_string(),
+                "error": command_error(
+                    "AUDIT_EXEC_FAILED",
+                    "failed to execute cargo audit",
+                    "security_diagnostics",
+                    true,
+                    &["Install cargo-audit: cargo install cargo-audit"],
+                    Some(&e.to_string()),
+                ),
             });
             return;
         }
@@ -338,7 +395,14 @@ pub async fn run_audit_on_startup(
             error!("Failed to parse `cargo audit` JSON output: {}", e);
             let mut cache = audit_cache.lock().await;
             *cache = serde_json::json!({
-                "error": e.to_string(),
+                "error": command_error(
+                    "AUDIT_PARSE_FAILED",
+                    "failed to parse cargo audit output",
+                    "security_diagnostics",
+                    true,
+                    &[],
+                    Some(&e.to_string()),
+                ),
             });
             return;
         }
@@ -409,5 +473,61 @@ mod tests {
         assert_eq!(s["file"], "src/main.rs");
         assert_eq!(s["line"], 5);
         assert_eq!(s["suggestion"], "prefix it with an underscore");
+    }
+
+    #[test]
+    fn summarize_audit_groups_and_deduplicates() {
+        let raw = json!({
+            "vulnerabilities": {
+                "list": [
+                    {
+                        "advisory": {
+                            "id": "RUSTSEC-2001-0001",
+                            "title": "vuln A",
+                            "patched_versions": [">= 2.0"],
+                        },
+                        "package": { "name": "foo", "version": "1.0.0" }
+                    },
+                    // same advisory, different version → groups under same ID
+                    {
+                        "advisory": {
+                            "id": "RUSTSEC-2001-0001",
+                            "title": "vuln A",
+                            "patched_versions": [">= 2.0"],
+                        },
+                        "package": { "name": "foo", "version": "1.1.0" }
+                    },
+                    // same advisory + same version → deduplicated within group
+                    {
+                        "advisory": {
+                            "id": "RUSTSEC-2001-0001",
+                            "title": "vuln A",
+                            "patched_versions": [">= 2.0"],
+                        },
+                        "package": { "name": "foo", "version": "1.0.0" }
+                    },
+                    // different advisory
+                    {
+                        "advisory": {
+                            "id": "RUSTSEC-2002-0002",
+                            "title": "vuln B",
+                            "patched_versions": [">= 3.0"],
+                        },
+                        "package": { "name": "bar", "version": "0.5.0" }
+                    }
+                ]
+            }
+        });
+
+        let results = summarize_audit(&raw);
+        assert_eq!(results.len(), 2);
+
+        let a = &results[0];
+        assert_eq!(a["id"], "RUSTSEC-2001-0001");
+        assert_eq!(a["affected_count"], 2); // 1.0.0 duplicate collapsed
+        assert_eq!(a["affected_packages"].as_array().unwrap().len(), 2);
+
+        assert_eq!(results[1]["id"], "RUSTSEC-2002-0002");
+        assert_eq!(results[1]["affected_count"], 1);
     }
 }
