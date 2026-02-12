@@ -29,8 +29,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -41,6 +40,129 @@ use tracing::{error, info, info_span, warn};
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 200;
+
+#[derive(Clone, Debug)]
+pub enum Phase {
+    Metadata,
+    Check,
+    Indexing,
+    Ready,
+    Failed(String),
+}
+
+impl Phase {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Check => "check",
+            Self::Indexing => "indexing",
+            Self::Ready => "ready",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CargoWarning {
+    pub source: String,
+    pub message: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectProgress {
+    pub phase: Phase,
+    pub started_at: Instant,
+    pub total_dependencies: usize,
+    pub new_dependencies: usize,
+    pub already_indexed: usize,
+    pub processed_count: usize,
+    pub failed_count: usize,
+    pub current_crate: Option<String>,
+    pub cargo_warnings: Vec<CargoWarning>,
+    pub estimated_total_secs: Option<f64>,
+}
+
+impl Default for ProjectProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProjectProgress {
+    pub fn new() -> Self {
+        Self {
+            phase: Phase::Metadata,
+            started_at: Instant::now(),
+            total_dependencies: 0,
+            new_dependencies: 0,
+            already_indexed: 0,
+            processed_count: 0,
+            failed_count: 0,
+            current_crate: None,
+            cargo_warnings: Vec::new(),
+            estimated_total_secs: None,
+        }
+    }
+
+    pub fn merge_cargo_warnings(&mut self, new_warnings: Vec<(String, String)>) {
+        for (source, message) in new_warnings {
+            if let Some(existing) = self
+                .cargo_warnings
+                .iter_mut()
+                .find(|w| w.source == source && w.message == message)
+            {
+                existing.count += 1;
+            } else {
+                self.cargo_warnings.push(CargoWarning {
+                    source,
+                    message,
+                    count: 1,
+                });
+            }
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let processed = self.processed_count.saturating_add(self.failed_count);
+        let percent = if self.total_dependencies == 0 {
+            100
+        } else {
+            ((processed * 100) / self.total_dependencies).min(100)
+        };
+        let elapsed_secs = self.started_at.elapsed().as_secs_f64();
+        // Only compute remaining estimate during indexing — the estimate covers
+        // indexing time only, so it's meaningless during metadata/check phases.
+        let estimated_remaining_secs = if matches!(self.phase, Phase::Indexing) {
+            self.estimated_total_secs
+                .map(|total| (total - elapsed_secs).max(0.0))
+        } else {
+            None
+        };
+        let failed_message = match &self.phase {
+            Phase::Failed(msg) => Some(msg.clone()),
+            _ => None,
+        };
+        serde_json::json!({
+            "phase": self.phase.as_str(),
+            "progress": {
+                "processed": self.processed_count,
+                "failed": self.failed_count,
+                "total": self.total_dependencies,
+                "percent": percent
+            },
+            "total_dependencies": self.total_dependencies,
+            "new_dependencies": self.new_dependencies,
+            "already_indexed": self.already_indexed,
+            "current_crate": self.current_crate,
+            "elapsed_secs": elapsed_secs,
+            "estimated_total_secs": self.estimated_total_secs,
+            "estimated_remaining_secs": estimated_remaining_secs,
+            "cargo_warnings": self.cargo_warnings,
+            "failed_message": failed_message
+        })
+    }
+}
 
 /// Extract and validate `limit` and `offset` from tool call arguments.
 fn extract_pagination(
@@ -87,8 +209,7 @@ pub struct ProjectState {
     pub diagnostics: Arc<Mutex<Vec<serde_json::Value>>>,
     pub outdated_dependencies: Arc<Mutex<serde_json::Value>>,
     pub security_advisories: Arc<Mutex<serde_json::Value>>,
-    pub index_ready: Arc<AtomicBool>,
-    pub index_error: Arc<Mutex<Option<String>>>,
+    pub progress: Arc<Mutex<ProjectProgress>>,
     /// Sends a cancellation signal to all background tasks (watcher, check, docs, outdated, audit).
     pub abort: Option<tokio::sync::watch::Sender<()>>,
 }
@@ -156,8 +277,33 @@ impl AppState {
         let meta = crate::engine::metadata::load_metadata(&canonical)
             .await
             .mcp_internal_err("Failed to load cargo metadata")?;
+        let index_packages = docs::collect_index_packages(&meta)
+            .mcp_internal_err("Failed to collect dependency package list")?;
+        let package_hashes: Vec<String> =
+            index_packages.iter().map(docs::package_id_hash).collect();
+        let already_indexed = self
+            .db
+            .call(move |conn| {
+                let mut count = 0usize;
+                for hash in &package_hashes {
+                    if docs::is_crate_indexed(conn, hash)? {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            })
+            .await
+            .mcp_internal_err("Failed to inspect existing documentation index state")?;
+        let total_dependencies = index_packages.len();
+        let new_dependencies = total_dependencies.saturating_sub(already_indexed);
+        let estimated_total_secs = new_dependencies as f64 * 1.5;
 
         let (abort_tx, abort_rx) = tokio::sync::watch::channel(());
+        let mut progress = ProjectProgress::new();
+        progress.total_dependencies = total_dependencies;
+        progress.new_dependencies = new_dependencies;
+        progress.already_indexed = already_indexed;
+        progress.estimated_total_secs = Some(estimated_total_secs);
 
         let project = Arc::new(Mutex::new(ProjectState {
             project_path: canonical.clone(),
@@ -165,8 +311,7 @@ impl AppState {
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
             security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            index_ready: Arc::new(AtomicBool::new(false)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: Arc::new(Mutex::new(progress)),
             abort: Some(abort_tx),
         }));
 
@@ -202,22 +347,24 @@ impl AppState {
             // cargo outdated and cargo audit don't use the build directory,
             // so they can run concurrently with everything else.
             let outdated_cache = Arc::clone(&project_guard.outdated_dependencies);
+            let progress = Arc::clone(&project_guard.progress);
             let proj_path = canonical.clone();
             let mut abort = abort_rx.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = abort.changed() => {}
-                    _ = diagnostics::run_outdated_on_startup(outdated_cache, &proj_path) => {}
+                    _ = diagnostics::run_outdated_on_startup(outdated_cache, &proj_path, progress) => {}
                 }
             });
 
             let audit_cache = Arc::clone(&project_guard.security_advisories);
+            let progress = Arc::clone(&project_guard.progress);
             let proj_path = canonical.clone();
             let mut abort = abort_rx.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = abort.changed() => {}
-                    _ = diagnostics::run_audit_on_startup(audit_cache, &proj_path) => {}
+                    _ = diagnostics::run_audit_on_startup(audit_cache, &proj_path, progress) => {}
                 }
             });
         }
@@ -235,23 +382,31 @@ impl AppState {
                 let guard = project_clone.lock().await;
                 let diag_cache = Arc::clone(&guard.diagnostics);
                 let path = guard.project_path.clone();
+                let progress = Arc::clone(&guard.progress);
                 drop(guard);
+
+                {
+                    let mut pg = progress.lock().await;
+                    pg.phase = Phase::Check;
+                    pg.current_crate = None;
+                }
 
                 tokio::select! {
                     _ = abort_check_docs.changed() => { return; }
-                    _ = diagnostics::run_check_on_startup(diag_cache, &path) => {}
+                    _ = diagnostics::run_check_on_startup(diag_cache, &path, Arc::clone(&progress)) => {}
                 }
             }
 
             // Step 2: doc indexing (reuses cached build artifacts)
-            let (metadata_clone, index_ready, index_error) = {
+            let (metadata_clone, progress) = {
                 let guard = project_clone.lock().await;
-                (
-                    Arc::clone(&guard.metadata),
-                    Arc::clone(&guard.index_ready),
-                    Arc::clone(&guard.index_error),
-                )
+                (Arc::clone(&guard.metadata), Arc::clone(&guard.progress))
             };
+
+            {
+                let mut pg = progress.lock().await;
+                pg.phase = Phase::Indexing;
+            }
 
             let result = tokio::select! {
                 _ = abort_check_docs.changed() => { return; }
@@ -259,18 +414,23 @@ impl AppState {
                     metadata_clone,
                     db_clone,
                     proj_path,
+                    Arc::clone(&progress),
                 ) => r
             };
 
             match result {
                 Ok(()) => {
-                    index_ready.store(true, Ordering::Release);
+                    let mut pg = progress.lock().await;
+                    pg.phase = Phase::Ready;
+                    pg.current_crate = None;
                     info!("Documentation index is ready.");
                 }
                 Err(e) => {
                     let msg = format!("{}", e);
                     error!("Failed to ensure docs are cached: {}", msg);
-                    *index_error.lock().await = Some(msg);
+                    let mut pg = progress.lock().await;
+                    pg.phase = Phase::Failed(msg);
+                    pg.current_crate = None;
                 }
             }
         });
@@ -279,6 +439,7 @@ impl AppState {
         if self.config.watcher.enabled {
             let project_guard = project.lock().await;
             let diag_cache_for_watcher = Arc::clone(&project_guard.diagnostics);
+            let progress_for_watcher = Arc::clone(&project_guard.progress);
             let workspace_root: PathBuf = project_guard.metadata.workspace_root.clone().into();
             drop(project_guard);
 
@@ -290,6 +451,7 @@ impl AppState {
                     workspace_root,
                     debounce_ms,
                     proj_path,
+                    progress_for_watcher,
                     abort_rx,
                 )
                 .await
@@ -299,9 +461,18 @@ impl AppState {
             });
         }
 
+        let project_progress = {
+            let guard = project.lock().await;
+            guard.progress.lock().await.to_json()
+        };
         let content = json_content(serde_json::json!({
             "status": "registered",
             "project_path": canonical.display().to_string(),
+            "total_dependencies": total_dependencies,
+            "new_dependencies": new_dependencies,
+            "already_indexed": already_indexed,
+            "estimated_index_time_secs": estimated_total_secs,
+            "project_progress": project_progress,
         }))?;
         Ok(CallToolResult::success(vec![content]))
     }
@@ -322,13 +493,21 @@ impl AppState {
         let mut entries = Vec::with_capacity(projects.len());
         for (path, state) in projects {
             let state_guard = state.lock().await;
-            let index_error = state_guard.index_error.lock().await.clone();
-            entries.push(serde_json::json!({
-                "project_path": path.display().to_string(),
-                "index_ready": state_guard.index_ready.load(Ordering::Acquire),
-                "index_error": index_error,
-                "diagnostics_count": state_guard.diagnostics.lock().await.len(),
-            }));
+            let progress_snapshot = state_guard.progress.lock().await.to_json();
+            let diagnostics_count = state_guard.diagnostics.lock().await.len();
+            let mut entry = progress_snapshot;
+            let obj = entry
+                .as_object_mut()
+                .expect("ProjectProgress::to_json always returns an object");
+            obj.insert(
+                "project_path".to_string(),
+                serde_json::Value::String(path.display().to_string()),
+            );
+            obj.insert(
+                "diagnostics_count".to_string(),
+                serde_json::Value::Number(diagnostics_count.into()),
+            );
+            entries.push(entry);
         }
         entries.sort_by(|a, b| {
             a["project_path"]
@@ -375,11 +554,18 @@ impl AppState {
         let raw_diagnostics = project_guard.diagnostics.lock().await.clone();
         let outdated_dependencies = project_guard.outdated_dependencies.lock().await.clone();
         let security_advisories = project_guard.security_advisories.lock().await.clone();
+        let progress_snapshot = project_guard.progress.lock().await.to_json();
+        let cargo_warnings = progress_snapshot
+            .get("cargo_warnings")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
         let build_diagnostics = diagnostics::summarize_diagnostics(&raw_diagnostics);
         let combined_report = serde_json::json!({
             "build_diagnostics": build_diagnostics,
             "outdated_dependencies": outdated_dependencies,
             "security_advisories": security_advisories,
+            "cargo_warnings": cargo_warnings,
+            "project_progress": progress_snapshot,
         });
         let content = Content::json(combined_report)?;
         Ok(CallToolResult::success(vec![content]))
@@ -403,16 +589,17 @@ impl AppState {
             let project = self.get_project(pp).await?;
             let project_guard = project.lock().await;
 
-            if !project_guard.index_ready.load(Ordering::Acquire) {
-                let reason = project_guard
-                    .index_error
-                    .lock()
-                    .await
-                    .as_ref()
-                    .map(|e| format!("Documentation indexing failed: {}", e))
-                    .unwrap_or_else(|| "Documentation index is not ready yet".to_string());
+            let progress_guard = project_guard.progress.lock().await;
+            if !matches!(progress_guard.phase, Phase::Ready) {
+                let phase = progress_guard.phase.as_str();
+                let snapshot = progress_guard.to_json();
+                drop(progress_guard);
+                let reason = format!(
+                    "Documentation index is not ready (phase: {phase}). Current progress: {snapshot}"
+                );
                 return Err(McpError::internal_error(reason, None));
             }
+            drop(progress_guard);
 
             let metadata = Arc::clone(&project_guard.metadata);
             drop(project_guard);
@@ -628,8 +815,10 @@ impl ServerHandler for AppState {
             instructions: Some(
                 "Rust toolchain MCP server. \
                  Register a project first with register_project — this starts background \
-                 indexing of rustdoc JSON for all dependencies. Use list_projects to check \
-                 index_ready status. Once ready, search_docs provides full-text search across \
+                 indexing of rustdoc JSON for all dependencies. The response includes \
+                 dependency counts and an estimated indexing time. Use list_projects to check \
+                 phase and progress (metadata -> check -> indexing -> ready). Once in the \
+                 ready phase, search_docs provides full-text search across \
                  all project dependencies. list_crates shows workspace crates. get_diagnostics \
                  returns build errors, outdated dependencies, and security advisories. \
                  Resources: cratedex://logs for server logs. \
@@ -795,7 +984,12 @@ impl ServerHandler for AppState {
                             "type": "object",
                             "properties": {
                                 "status": { "type": "string" },
-                                "project_path": { "type": "string" }
+                                "project_path": { "type": "string" },
+                                "total_dependencies": { "type": "integer" },
+                                "new_dependencies": { "type": "integer" },
+                                "already_indexed": { "type": "integer" },
+                                "estimated_index_time_secs": { "type": "number" },
+                                "project_progress": { "type": "object" }
                             },
                             "required": ["status", "project_path"]
                         })
@@ -835,7 +1029,19 @@ impl ServerHandler for AppState {
                                 "type": "object",
                                 "properties": {
                                     "project_path": { "type": "string" },
-                                    "index_ready": { "type": "boolean" },
+                                    "phase": { "type": "string" },
+                                    "progress": {
+                                        "type": "object",
+                                        "properties": {
+                                            "processed": { "type": "integer" },
+                                            "failed": { "type": "integer" },
+                                            "total": { "type": "integer" },
+                                            "percent": { "type": "integer" }
+                                        }
+                                    },
+                                    "elapsed_secs": { "type": "number" },
+                                    "estimated_remaining_secs": { "type": ["number", "null"] },
+                                    "cargo_warnings": { "type": "array" },
                                     "diagnostics_count": { "type": "integer" }
                                 }
                             }
@@ -903,9 +1109,21 @@ impl ServerHandler for AppState {
                             "properties": {
                                 "build_diagnostics": { "type": "array", "items": { "type": "object" } },
                                 "outdated_dependencies": {},
-                                "security_advisories": {}
+                                "security_advisories": {},
+                                "cargo_warnings": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "source": { "type": "string" },
+                                            "message": { "type": "string" },
+                                            "count": { "type": "integer" }
+                                        }
+                                    }
+                                },
+                                "project_progress": { "type": "object" }
                             },
-                            "required": ["build_diagnostics", "outdated_dependencies", "security_advisories"]
+                            "required": ["build_diagnostics", "outdated_dependencies", "security_advisories", "cargo_warnings", "project_progress"]
                         })
                         .as_object()
                         .cloned()
@@ -1286,6 +1504,7 @@ async fn watch_for_changes(
     workspace_root: PathBuf,
     debounce_ms: u64,
     project_path: PathBuf,
+    progress: Arc<Mutex<ProjectProgress>>,
     mut abort_rx: tokio::sync::watch::Receiver<()>,
 ) -> notify::Result<()> {
     use notify::EventKind;
@@ -1331,7 +1550,12 @@ async fn watch_for_changes(
                 while rx.try_recv().is_ok() {}
 
                 info!("Running diagnostics after file change...");
-                diagnostics::run_check_on_startup(Arc::clone(&diagnostics_cache), &project_path).await;
+                diagnostics::run_check_on_startup(
+                    Arc::clone(&diagnostics_cache),
+                    &project_path,
+                    Arc::clone(&progress),
+                )
+                .await;
             }
         }
     }
@@ -1357,6 +1581,89 @@ mod tests {
             docs::ensure_docs_table_and_fts(&conn).unwrap();
         }
         db
+    }
+
+    fn ready_progress() -> Arc<Mutex<ProjectProgress>> {
+        let mut progress = ProjectProgress::new();
+        progress.phase = Phase::Ready;
+        Arc::new(Mutex::new(progress))
+    }
+
+    // ───── Phase::as_str tests ─────
+
+    #[test]
+    fn phase_as_str_returns_expected_values() {
+        assert_eq!(Phase::Metadata.as_str(), "metadata");
+        assert_eq!(Phase::Check.as_str(), "check");
+        assert_eq!(Phase::Indexing.as_str(), "indexing");
+        assert_eq!(Phase::Ready.as_str(), "ready");
+        assert_eq!(Phase::Failed("boom".into()).as_str(), "failed");
+    }
+
+    // ───── merge_cargo_warnings tests ─────
+
+    #[test]
+    fn merge_cargo_warnings_deduplicates_and_counts() {
+        let mut progress = ProjectProgress::new();
+
+        progress.merge_cargo_warnings(vec![
+            ("cargo check".into(), "warning: unused import".into()),
+            ("cargo check".into(), "warning: unused import".into()),
+            ("cargo check".into(), "error: type mismatch".into()),
+        ]);
+
+        assert_eq!(progress.cargo_warnings.len(), 2);
+
+        let unused = progress
+            .cargo_warnings
+            .iter()
+            .find(|w| w.message == "warning: unused import")
+            .unwrap();
+        assert_eq!(unused.count, 2);
+        assert_eq!(unused.source, "cargo check");
+
+        let mismatch = progress
+            .cargo_warnings
+            .iter()
+            .find(|w| w.message == "error: type mismatch")
+            .unwrap();
+        assert_eq!(mismatch.count, 1);
+    }
+
+    #[test]
+    fn merge_cargo_warnings_distinguishes_sources() {
+        let mut progress = ProjectProgress::new();
+
+        progress.merge_cargo_warnings(vec![
+            ("cargo check".into(), "warning: unused import".into()),
+            ("cargo rustdoc".into(), "warning: unused import".into()),
+        ]);
+
+        // Same message but different sources — should remain as two separate entries
+        assert_eq!(progress.cargo_warnings.len(), 2);
+    }
+
+    // ───── to_json tests ─────
+
+    #[test]
+    fn to_json_estimated_remaining_only_during_indexing() {
+        let mut progress = ProjectProgress::new();
+        progress.estimated_total_secs = Some(100.0);
+
+        // During Metadata phase, estimated_remaining_secs should be null
+        progress.phase = Phase::Metadata;
+        let json = progress.to_json();
+        assert!(json["estimated_remaining_secs"].is_null());
+
+        // During Check phase, estimated_remaining_secs should be null
+        progress.phase = Phase::Check;
+        let json = progress.to_json();
+        assert!(json["estimated_remaining_secs"].is_null());
+
+        // During Indexing phase, estimated_remaining_secs should be a number
+        progress.phase = Phase::Indexing;
+        let json = progress.to_json();
+        assert!(json["estimated_remaining_secs"].is_number());
     }
 
     /// Helper to extract the JSON text from a CallToolResult's first content item.
@@ -1704,8 +2011,7 @@ mod tests {
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
             security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            index_ready: Arc::new(AtomicBool::new(true)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: ready_progress(),
             abort: None,
         };
         {
@@ -2014,8 +2320,7 @@ mod tests {
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
             security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            index_ready: Arc::new(AtomicBool::new(true)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: ready_progress(),
             abort: None,
         };
         let state_zeta = ProjectState {
@@ -2024,8 +2329,7 @@ mod tests {
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
             security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            index_ready: Arc::new(AtomicBool::new(true)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: ready_progress(),
             abort: None,
         };
 
@@ -2063,8 +2367,7 @@ mod tests {
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
             security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            index_ready: Arc::new(AtomicBool::new(true)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: ready_progress(),
             abort: None,
         };
         {
@@ -2148,8 +2451,7 @@ mod tests {
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
             security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            index_ready: Arc::new(AtomicBool::new(true)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: ready_progress(),
             abort: None,
         };
         {
@@ -2213,8 +2515,7 @@ mod tests {
             })])),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::json!({"dep_a": "outdated"}))),
             security_advisories: Arc::new(Mutex::new(serde_json::Value::Null)),
-            index_ready: Arc::new(AtomicBool::new(true)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: ready_progress(),
             abort: None,
         };
         let state_b = ProjectState {
@@ -2233,8 +2534,7 @@ mod tests {
             })])),
             outdated_dependencies: Arc::new(Mutex::new(serde_json::Value::Null)),
             security_advisories: Arc::new(Mutex::new(serde_json::json!({"vuln": "found"}))),
-            index_ready: Arc::new(AtomicBool::new(true)),
-            index_error: Arc::new(Mutex::new(None)),
+            progress: ready_progress(),
             abort: None,
         };
 

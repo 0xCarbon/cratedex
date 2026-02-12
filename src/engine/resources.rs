@@ -22,6 +22,7 @@ const LOG_URI: &str = "cratedex://logs";
 
 /// Default capacity for log buffers.
 pub const LOG_BUFFER_CAPACITY: usize = 500;
+const MAX_LOG_LINE_LEN: usize = 500;
 
 // ───── Tracing Layer ─────
 
@@ -101,7 +102,7 @@ impl<S: Subscriber> Layer<S> for LogCaptureLayer {
         let timestamp = format_iso8601_utc(std::time::SystemTime::now());
 
         let level = event.metadata().level();
-        let line = format!("{} {} {}", timestamp, level, visitor.message);
+        let line = truncate_log_line(format!("{} {} {}", timestamp, level, visitor.message));
 
         if let Ok(mut buf) = self.buffer.lock() {
             if buf.len() >= self.capacity {
@@ -109,6 +110,20 @@ impl<S: Subscriber> Layer<S> for LogCaptureLayer {
             }
             buf.push_back(line);
         }
+    }
+}
+
+fn truncate_log_line(line: String) -> String {
+    if line.len() > MAX_LOG_LINE_LEN {
+        let suffix = "... (truncated)";
+        let mut keep = MAX_LOG_LINE_LEN.saturating_sub(suffix.len());
+        // Avoid panicking on multi-byte UTF-8 boundaries.
+        while keep > 0 && !line.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        format!("{}{}", &line[..keep], suffix)
+    } else {
+        line
     }
 }
 
@@ -221,5 +236,25 @@ mod tests {
     fn format_iso8601_utc_produces_valid_timestamp() {
         let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1749997800);
         assert_eq!(format_iso8601_utc(time), "2025-06-15T14:30:00Z");
+    }
+
+    #[test]
+    fn truncate_log_line_caps_output() {
+        let line = "x".repeat(600);
+        let truncated = truncate_log_line(line);
+        assert_eq!(truncated.len(), MAX_LOG_LINE_LEN);
+        assert!(truncated.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn truncate_log_line_handles_multibyte_utf8() {
+        // Each emoji is 4 bytes. Build a string that forces the cut to land mid-character.
+        let emoji = "\u{1F980}"; // crab emoji, 4 bytes
+        let line = emoji.repeat(200); // 800 bytes
+        let truncated = truncate_log_line(line);
+        assert!(truncated.len() <= MAX_LOG_LINE_LEN);
+        assert!(truncated.ends_with("... (truncated)"));
+        // Must be valid UTF-8 (this would panic if not)
+        let _ = truncated.chars().count();
     }
 }

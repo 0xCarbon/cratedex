@@ -1,6 +1,9 @@
 //! The diagnostics engine is responsible for providing code health information.
 
-use crate::engine::command::{new_cargo_command, run_with_timeout};
+use crate::engine::command::{
+    extract_cargo_warnings, new_cargo_command, run_with_timeout, stderr_preview,
+};
+use crate::engine::server::ProjectProgress;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -92,7 +95,11 @@ fn summarize_one(diag: &Value) -> Option<Value> {
 }
 
 /// Runs `cargo check` in the background and continuously updates the diagnostics cache.
-pub async fn run_check_on_startup(diagnostics_cache: Arc<Mutex<Vec<Value>>>, project_path: &Path) {
+pub async fn run_check_on_startup(
+    diagnostics_cache: Arc<Mutex<Vec<Value>>>,
+    project_path: &Path,
+    progress: Arc<Mutex<ProjectProgress>>,
+) {
     info!("Running initial `cargo check`...");
 
     let mut cmd = new_cargo_command(project_path);
@@ -111,6 +118,10 @@ pub async fn run_check_on_startup(diagnostics_cache: Arc<Mutex<Vec<Value>>>, pro
             return;
         }
     };
+    let cargo_warnings = extract_cargo_warnings(&output.stderr, "cargo check");
+    if !cargo_warnings.is_empty() {
+        progress.lock().await.merge_cargo_warnings(cargo_warnings);
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut cache = diagnostics_cache.lock().await;
@@ -125,7 +136,11 @@ pub async fn run_check_on_startup(diagnostics_cache: Arc<Mutex<Vec<Value>>>, pro
 }
 
 /// Runs `cargo outdated` in the background and updates the cache.
-pub async fn run_outdated_on_startup(outdated_cache: Arc<Mutex<Value>>, project_path: &Path) {
+pub async fn run_outdated_on_startup(
+    outdated_cache: Arc<Mutex<Value>>,
+    project_path: &Path,
+    progress: Arc<Mutex<ProjectProgress>>,
+) {
     info!("Running `cargo outdated`...");
 
     let mut cmd = new_cargo_command(project_path);
@@ -145,9 +160,13 @@ pub async fn run_outdated_on_startup(outdated_cache: Arc<Mutex<Value>>, project_
             return;
         }
     };
+    let cargo_warnings = extract_cargo_warnings(&output.stderr, "cargo outdated");
+    if !cargo_warnings.is_empty() {
+        progress.lock().await.merge_cargo_warnings(cargo_warnings);
+    }
 
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let err = stderr_preview(&output.stderr, 10);
         error!("`cargo outdated` command failed: {}", err);
         let mut cache = outdated_cache.lock().await;
         *cache = serde_json::json!({
@@ -175,7 +194,11 @@ pub async fn run_outdated_on_startup(outdated_cache: Arc<Mutex<Value>>, project_
 }
 
 /// Runs `cargo audit` in the background and updates the cache.
-pub async fn run_audit_on_startup(audit_cache: Arc<Mutex<Value>>, project_path: &Path) {
+pub async fn run_audit_on_startup(
+    audit_cache: Arc<Mutex<Value>>,
+    project_path: &Path,
+    progress: Arc<Mutex<ProjectProgress>>,
+) {
     info!("Running `cargo audit`...");
 
     let mut cmd = new_cargo_command(project_path);
@@ -195,6 +218,10 @@ pub async fn run_audit_on_startup(audit_cache: Arc<Mutex<Value>>, project_path: 
             return;
         }
     };
+    let cargo_warnings = extract_cargo_warnings(&output.stderr, "cargo audit");
+    if !cargo_warnings.is_empty() {
+        progress.lock().await.merge_cargo_warnings(cargo_warnings);
+    }
 
     // `cargo audit` exits with a non-zero status code if vulnerabilities are found,
     // so we check for that specifically. We still want to parse the output.

@@ -22,7 +22,7 @@ pub enum Commands {
     Server,
     /// Installs optional prerequisites like cargo-outdated and cargo-audit.
     Setup,
-    /// Install cratedex as a systemd service (HTTP transport).
+    /// Install cratedex as a background service (HTTP transport).
     InstallService {
         /// HTTP bind address.
         #[arg(long, default_value = "127.0.0.1")]
@@ -30,23 +30,23 @@ pub enum Commands {
         /// HTTP bind port.
         #[arg(long, default_value_t = 3737)]
         port: u16,
-        /// Enable loginctl linger so the service survives logout.
+        /// Enable loginctl linger so the service survives logout (Linux only).
         #[arg(long, conflicts_with = "system")]
         linger: bool,
         /// Allow binding to non-loopback addresses (only enable behind TLS+auth reverse proxy).
         #[arg(long)]
         allow_remote: bool,
-        /// Install as a system-level service (writes to /etc/systemd/system,
-        /// managed with plain `systemctl`). Requires root.
+        /// Install as a system-level service. Linux uses systemd; macOS uses launchd.
+        /// On Windows this currently returns a runtime error.
         #[arg(long, conflicts_with = "linger")]
         system: bool,
-        /// User account the system service runs as (default: $SUDO_USER or current user).
+        /// User account the system service runs as (Linux/macOS, requires --system).
         #[arg(long, default_value = None, requires = "system")]
         run_as: Option<String>,
     },
-    /// Remove the cratedex systemd service.
+    /// Remove the cratedex background service.
     RemoveService {
-        /// Remove the system-level service (from /etc/systemd/system). Requires root.
+        /// Remove the system-level service. Linux/macOS require root.
         #[arg(long)]
         system: bool,
     },

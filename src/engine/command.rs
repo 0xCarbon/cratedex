@@ -43,3 +43,64 @@ pub async fn run_with_timeout(
         Err(_) => Err(anyhow::anyhow!("{} timed out after {}s", context, timeout.as_secs()).into()),
     }
 }
+
+/// Return the first `max_lines` lines from stderr for compact logs and errors.
+pub fn stderr_preview(stderr: &[u8], max_lines: usize) -> String {
+    if max_lines == 0 {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(stderr);
+    text.lines().take(max_lines).collect::<Vec<_>>().join("\n")
+}
+
+/// Extract cargo `warning:` and `error:` lines, tagged with the command source.
+pub fn extract_cargo_warnings(stderr: &[u8], source: &str) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(stderr);
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("warning:") || trimmed.starts_with("error:") {
+                Some((source.to_string(), trimmed.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_cargo_warnings, stderr_preview};
+
+    #[test]
+    fn stderr_preview_limits_lines() {
+        let input = b"line1\nline2\nline3\n";
+        assert_eq!(stderr_preview(input, 2), "line1\nline2");
+    }
+
+    #[test]
+    fn stderr_preview_handles_empty() {
+        assert_eq!(stderr_preview(b"", 5), "");
+        assert_eq!(stderr_preview(b"line1", 0), "");
+    }
+
+    #[test]
+    fn extract_cargo_warnings_filters_relevant_lines() {
+        let input =
+            b"Compiling foo\nwarning: profile ignored\nnote: details\nerror: failed to select\n";
+        let warnings = extract_cargo_warnings(input, "cargo test");
+        assert_eq!(
+            warnings,
+            vec![
+                (
+                    "cargo test".to_string(),
+                    "warning: profile ignored".to_string()
+                ),
+                (
+                    "cargo test".to_string(),
+                    "error: failed to select".to_string()
+                ),
+            ]
+        );
+    }
+}

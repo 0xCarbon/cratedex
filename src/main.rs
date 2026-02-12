@@ -1,8 +1,8 @@
 use anyhow::Result;
+use clap::Parser;
 use cratedex::cli::{Cli, Commands};
 use cratedex::engine;
 use cratedex::service;
-use clap::Parser;
 
 fn init_simple_tracing() {
     tracing_subscriber::fmt()

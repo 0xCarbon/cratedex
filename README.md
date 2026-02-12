@@ -9,6 +9,36 @@
 
 MCP (Model Context Protocol) server for Rust documentation indexing, full-text search, and project diagnostics.
 
+## Quick Start
+
+1. Install:
+
+```bash
+cargo install cratedex
+```
+
+2. Run as a background service (Linux user service):
+
+```bash
+cratedex install-service --linger
+```
+
+3. Connect your AI coding tool:
+
+```bash
+# Claude Code
+claude mcp add --scope user --transport http cratedex http://127.0.0.1:3737/mcp
+
+# Codex
+codex mcp add cratedex --url http://127.0.0.1:3737/mcp
+```
+
+For OpenCode, add an HTTP MCP server entry that points to:
+
+```text
+http://127.0.0.1:3737/mcp
+```
+
 ## Features
 
 - Full-text search across Rust crate documentation (SQLite FTS5)
@@ -26,20 +56,6 @@ MCP (Model Context Protocol) server for Rust documentation indexing, full-text s
 
 ```bash
 cargo install cratedex
-```
-
-## Usage
-
-Start the MCP server (HTTP transport, default):
-
-```bash
-cratedex server
-```
-
-Or with stdio transport:
-
-```bash
-CRATEDEX__SERVER__TRANSPORT=stdio cratedex server
 ```
 
 ## Configuration
@@ -102,65 +118,6 @@ A single `cratedex` process serves all clients over HTTP. Avoids database lock c
 
 Endpoint: `http://<host>:<port>/mcp` (default `http://127.0.0.1:3737/mcp`)
 
-## Running as a systemd User Service
-
-For a persistent shared HTTP daemon, install cratedex as a systemd user service:
-
-```bash
-cratedex install-service
-```
-
-This writes a service unit to `~/.config/systemd/user/cratedex.service`, runs `daemon-reload`, and enables + starts the service. The command is idempotent — re-running it restarts the service with the latest binary.
-
-Options:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--host` | `127.0.0.1` | HTTP bind address |
-| `--port` | `3737` | HTTP bind port |
-| `--linger` | off | Enable `loginctl enable-linger` so the service survives logout |
-| `--allow-remote` | off | Allow non-loopback bind (use only behind TLS+auth reverse proxy) |
-| `--system` | off | Install as a system-level service in `/etc/systemd/system`, managed with plain `systemctl` |
-| `--run-as` | `$SUDO_USER` | User account the system service runs as (requires `--system`) |
-
-To verify:
-
-```bash
-systemctl --user status cratedex
-journalctl --user -u cratedex -f
-```
-
-### Install as a System Service (recommended for servers/headless)
-
-A system-level service runs a single shared daemon under `/etc/systemd/system`, managed with plain `systemctl` (no `--user`). This is the most reliable option for headless machines, SSH-only setups, or environments where `systemctl --user` is broken (e.g. missing D-Bus user session).
-
-```bash
-cargo build --release
-sudo install -m 0755 target/release/cratedex /usr/local/bin/cratedex
-sudo cratedex install-service --system
-```
-
-The service runs as `User=<your-user>` (defaults to `$SUDO_USER`) so it reuses your existing Rust toolchains, cargo cache, and database at `~/.cratedex/`. This means no separate setup is needed — the daemon has access to everything your user account already has.
-
-To verify:
-
-```bash
-systemctl status cratedex
-journalctl -u cratedex -f
-```
-
-To remove:
-
-```bash
-sudo cratedex remove-service --system
-```
-
-To remove the per-user service:
-
-```bash
-cratedex remove-service
-```
-
 ## Client Configuration
 
 ### Claude Code
@@ -188,6 +145,63 @@ Configure the client to spawn the server directly:
   }
 }
 ```
+
+## Advanced Service Management
+
+### Linux: systemd User Service
+
+For a persistent shared HTTP daemon, install cratedex as a systemd user service:
+
+```bash
+cratedex install-service
+```
+
+This writes a service unit to `~/.config/systemd/user/cratedex.service`, runs `daemon-reload`, and enables + starts the service. The command is idempotent.
+
+To verify:
+
+```bash
+systemctl --user status cratedex
+journalctl --user -u cratedex -f
+```
+
+To remove:
+
+```bash
+cratedex remove-service
+```
+
+### Linux: systemd System Service
+
+A system-level service runs a shared daemon under `/etc/systemd/system`, managed with plain `systemctl`.
+
+```bash
+sudo install -m 0755 "$(which cratedex)" /usr/local/bin/cratedex
+sudo cratedex install-service --system
+```
+
+To verify:
+
+```bash
+systemctl status cratedex
+journalctl -u cratedex -f
+```
+
+To remove:
+
+```bash
+sudo cratedex remove-service --system
+```
+
+### macOS: launchd
+
+`cratedex install-service` installs a LaunchAgent in `~/Library/LaunchAgents/`.
+Use `--system` (with sudo) for `/Library/LaunchDaemons/`.
+
+### Windows: Task Scheduler
+
+`cratedex install-service` installs a user-level scheduled task at logon.
+System-level Windows Services are not implemented directly; use NSSM for that deployment model.
 
 ## License
 

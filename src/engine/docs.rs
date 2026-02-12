@@ -1,7 +1,10 @@
 //! The documentation engine is responsible for generating and indexing docs.
 
 use crate::db::Db;
-use crate::engine::command::{new_nightly_cargo_command, run_with_timeout};
+use crate::engine::command::{
+    extract_cargo_warnings, new_nightly_cargo_command, run_with_timeout, stderr_preview,
+};
+use crate::engine::server::ProjectProgress;
 use crate::error::{AppError, AppResult};
 use cargo_metadata::{Metadata, Node, Package, PackageId, camino::Utf8Path};
 use rusqlite::{Connection, params};
@@ -12,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tracing::{info, info_span, warn};
 
 const RUSTDOC_TIMEOUT: Duration = Duration::from_mins(3);
@@ -105,7 +109,7 @@ fn ensure_docs_schema(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-fn is_crate_indexed(conn: &Connection, package_id_hash: &str) -> AppResult<bool> {
+pub fn is_crate_indexed(conn: &Connection, package_id_hash: &str) -> AppResult<bool> {
     let mut stmt =
         conn.prepare_cached(r#"SELECT 1 FROM "docs" WHERE package_id_hash = ?1 LIMIT 1"#)?;
     let exists = stmt.exists(params![package_id_hash])?;
@@ -118,6 +122,7 @@ pub async fn ensure_docs_are_cached_and_indexed(
     metadata: Arc<Metadata>,
     db: Arc<Db>,
     project_path: PathBuf,
+    progress: Arc<Mutex<ProjectProgress>>,
 ) -> AppResult<()> {
     let index_packages = collect_index_packages(&metadata)?;
     let span = info_span!("index_docs", packages = %index_packages.len());
@@ -135,30 +140,55 @@ pub async fn ensure_docs_are_cached_and_indexed(
     info!("Docs table ready.");
 
     let mut json_paths: Vec<(Package, PathBuf)> = Vec::new();
+    let mut failure_reasons: HashMap<String, usize> = HashMap::new();
     let target_dir = metadata.target_directory.clone();
 
     for package in &index_packages {
+        {
+            let mut progress_guard = progress.lock().await;
+            progress_guard.current_crate = Some(format!("{} {}", package.name, package.version));
+        }
         let cached_path = cache_dir.join(doc_cache_filename(package));
 
         if !cached_path.exists()
-            && let Err(e) =
-                generate_docs_for_package(package, target_dir.as_path(), &project_path).await
+            && let Err(e) = generate_docs_for_package(
+                package,
+                target_dir.as_path(),
+                &project_path,
+                Arc::clone(&progress),
+            )
+            .await
         {
-            warn!(
-                "docs: {} {} (generation failed: {})",
-                package.name, package.version, e
-            );
+            let message = e.to_string();
+            let reason = message
+                .split_once(": ")
+                .map(|(_, tail)| tail)
+                .unwrap_or(message.as_str())
+                .lines()
+                .next()
+                .unwrap_or("unknown generation failure")
+                .to_string();
+            *failure_reasons.entry(reason).or_insert(0) += 1;
+            let mut progress_guard = progress.lock().await;
+            progress_guard.failed_count += 1;
             continue;
         }
 
         if cached_path.exists() {
             json_paths.push((package.clone(), cached_path));
+            let mut progress_guard = progress.lock().await;
+            progress_guard.processed_count += 1;
         } else {
-            warn!(
-                "docs: {} {} (json not found after generation)",
-                package.name, package.version
-            );
+            *failure_reasons
+                .entry("json not found after generation".to_string())
+                .or_insert(0) += 1;
+            let mut progress_guard = progress.lock().await;
+            progress_guard.failed_count += 1;
         }
+    }
+
+    for (reason, count) in &failure_reasons {
+        warn!("{count} crates failed doc generation: {reason}");
     }
 
     info!(
@@ -167,6 +197,10 @@ pub async fn ensure_docs_are_cached_and_indexed(
     );
 
     for (i, (package, json_path)) in json_paths.iter().enumerate() {
+        {
+            let mut progress_guard = progress.lock().await;
+            progress_guard.current_crate = Some(format!("{} {}", package.name, package.version));
+        }
         let pkg_hash = package_id_hash(package);
 
         info!(
@@ -206,6 +240,10 @@ pub async fn ensure_docs_are_cached_and_indexed(
         }
     }
 
+    {
+        let mut progress_guard = progress.lock().await;
+        progress_guard.current_crate = None;
+    }
     info!("All documentation is now cached and indexed.");
     Ok(())
 }
@@ -341,6 +379,7 @@ async fn generate_docs_for_package(
     package: &Package,
     target_dir: &Utf8Path,
     project_path: &Path,
+    progress: Arc<Mutex<ProjectProgress>>,
 ) -> AppResult<()> {
     let package_spec = if package.source.is_some() {
         format!("{}@{}", package.name, package.version)
@@ -358,13 +397,17 @@ async fn generate_docs_for_package(
         .arg("json");
 
     let output = run_with_timeout(&mut cmd, RUSTDOC_TIMEOUT, "`cargo rustdoc`").await?;
+    let cargo_warnings = extract_cargo_warnings(&output.stderr, "cargo rustdoc");
+    if !cargo_warnings.is_empty() {
+        progress.lock().await.merge_cargo_warnings(cargo_warnings);
+    }
 
     if !output.status.success() {
         return Err(anyhow::anyhow!(
             "`cargo rustdoc` failed for {} {}: {}",
             package.name,
             package.version,
-            String::from_utf8_lossy(&output.stderr)
+            stderr_preview(&output.stderr, 5)
         )
         .into());
     }
@@ -432,7 +475,7 @@ fn doc_cache_filename(package: &Package) -> String {
     )
 }
 
-fn package_id_hash(package: &Package) -> String {
+pub fn package_id_hash(package: &Package) -> String {
     let mut hasher = Sha256::new();
     hasher.update(package.id.repr.as_bytes());
     let bytes = hasher.finalize();
@@ -479,7 +522,7 @@ fn write_doc_meta(cached_json: &Path, package: &Package, pkg_hash: &str) -> AppR
 }
 
 /// Collect all packages reachable from workspace members (workspace + transitive deps).
-fn collect_index_packages(metadata: &Metadata) -> AppResult<Vec<Package>> {
+pub fn collect_index_packages(metadata: &Metadata) -> AppResult<Vec<Package>> {
     let resolve = metadata
         .resolve
         .as_ref()
