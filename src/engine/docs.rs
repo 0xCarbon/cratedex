@@ -10,15 +10,15 @@ use cargo_metadata::{Metadata, Node, Package, PackageId, camino::Utf8Path};
 use rusqlite::{Connection, params};
 use rustdoc_types::{Crate, ItemEnum};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, info_span, warn};
+use tracing::{debug, info, info_span, warn};
 
-const RUSTDOC_TIMEOUT: Duration = Duration::from_mins(3);
+const RUSTDOC_WORKSPACE_TIMEOUT: Duration = Duration::from_mins(10);
 
 struct DocItem {
     crate_name: String,
@@ -78,34 +78,6 @@ pub fn ensure_docs_table_and_fts(conn: &Connection) -> AppResult<()> {
         END;
         "#,
     )?;
-
-    // Drop legacy Turso FTS index if it exists (migration)
-    conn.execute_batch(r#"DROP INDEX IF EXISTS "idx_docs_fts";"#)?;
-
-    ensure_docs_schema(conn)?;
-    Ok(())
-}
-
-fn ensure_docs_schema(conn: &Connection) -> AppResult<()> {
-    let has_pkg_hash = {
-        let mut stmt = conn.prepare(r#"PRAGMA table_info("docs")"#)?;
-        stmt.query_map([], |row| {
-            let name: String = row.get(1)?;
-            Ok(name)
-        })?
-        .any(|r| r.map(|n| n == "package_id_hash").unwrap_or(false))
-    };
-
-    if !has_pkg_hash {
-        conn.execute_batch(
-            r#"
-            ALTER TABLE "docs" ADD COLUMN package_id_hash TEXT NOT NULL DEFAULT '';
-            CREATE INDEX IF NOT EXISTS "idx_docs_pkg_hash" ON "docs" (package_id_hash);
-            DELETE FROM "docs";
-            "#,
-        )?;
-    }
-
     Ok(())
 }
 
@@ -118,16 +90,23 @@ pub fn is_crate_indexed(conn: &Connection, package_id_hash: &str) -> AppResult<b
 
 /// For each package in the workspace, ensures that a rustdoc JSON file
 /// is generated, cached, and indexed.
+///
+/// Phase 1a generates docs only for workspace crates (with a longer timeout).
+/// Phase 1b checks the cache for dependency crates (no `cargo rustdoc` invocation).
+/// Phase 2 runs concurrently via an mpsc channel, indexing packages into the DB
+/// as soon as their cached JSON becomes available.
 pub async fn ensure_docs_are_cached_and_indexed(
     metadata: Arc<Metadata>,
     db: Arc<Db>,
     project_path: PathBuf,
     progress: Arc<Mutex<ProjectProgress>>,
 ) -> AppResult<()> {
-    let index_packages = collect_index_packages(&metadata)?;
+    let IndexPackages {
+        packages: index_packages,
+        ..
+    } = collect_index_packages(&metadata)?;
     let span = info_span!("index_docs", packages = %index_packages.len());
     let _enter = span.enter();
-    info!("Checking for cached rustdoc JSON for all dependencies...");
 
     let cache_dir = get_doc_cache_dir()?;
 
@@ -139,13 +118,103 @@ pub async fn ensure_docs_are_cached_and_indexed(
     .await?;
     info!("Docs table ready.");
 
-    let mut json_paths: Vec<(Package, PathBuf)> = Vec::new();
+    let workspace_members: HashSet<PackageId> =
+        metadata.workspace_members.iter().cloned().collect();
+    let (workspace_packages, dep_packages): (Vec<_>, Vec<_>) = index_packages
+        .into_iter()
+        .partition(|pkg| workspace_members.contains(&pkg.id));
+
+    info!(
+        "Phase 1: {} workspace crates, {} dependency crates",
+        workspace_packages.len(),
+        dep_packages.len()
+    );
+
     let target_dir = metadata.target_directory.clone();
 
-    for package in &index_packages {
+    // Pipeline: Phase 1 produces (Package, PathBuf), Phase 2 consumes and indexes.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Package, PathBuf)>(32);
+
+    // Phase 2 consumer — indexes packages into the DB as they arrive.
+    let db_p2 = Arc::clone(&db);
+    let progress_p2 = Arc::clone(&progress);
+    let phase2 = tokio::spawn(async move {
+        let mut indexed_count = 0usize;
+        while let Some((package, json_path)) = rx.recv().await {
+            {
+                let mut pg = progress_p2.lock().await;
+                pg.current_crate = Some(format!("{} {}", package.name, package.version));
+            }
+            let pkg_hash = package_id_hash(&package);
+
+            let already_indexed = {
+                let hash = pkg_hash.clone();
+                match db_p2.call(move |conn| is_crate_indexed(conn, &hash)).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "Failed to check index for {} {}: {}",
+                            package.name, package.version, e
+                        );
+                        false
+                    }
+                }
+            };
+
+            if already_indexed {
+                debug!(
+                    "docs: {} {} (already in global index)",
+                    package.name, package.version
+                );
+                indexed_count += 1;
+                continue;
+            }
+
+            let should_idx = match should_index_package(&json_path, &pkg_hash) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "Failed to check meta for {} {}: {}",
+                        package.name, package.version, e
+                    );
+                    true
+                }
+            };
+
+            if should_idx {
+                let version = package.version.to_string();
+                if let Err(e) = index_rustdoc_json(&json_path, &db_p2, &version, &pkg_hash).await {
+                    warn!(
+                        "Failed to index {} {}: {}",
+                        package.name, package.version, e
+                    );
+                    continue;
+                }
+                if let Err(e) = write_doc_meta(&json_path, &package, &pkg_hash) {
+                    warn!(
+                        "Failed to write doc meta for {} {}: {}",
+                        package.name, package.version, e
+                    );
+                }
+                info!("docs: {} {} (indexed)", package.name, package.version);
+                indexed_count += 1;
+            } else {
+                debug!("docs: {} {} (up-to-date)", package.name, package.version);
+                indexed_count += 1;
+            }
+        }
+        indexed_count
+    });
+
+    // Phase 1a: Generate docs for workspace crates (longer timeout).
+    info!(
+        "Phase 1a: Generating docs for {} workspace crates...",
+        workspace_packages.len()
+    );
+    for package in &workspace_packages {
         {
-            let mut progress_guard = progress.lock().await;
-            progress_guard.current_crate = Some(format!("{} {}", package.name, package.version));
+            let mut pg = progress.lock().await;
+            pg.current_crate = Some(format!("{} {}", package.name, package.version));
         }
         let cached_path = cache_dir.join(doc_cache_filename(package));
 
@@ -155,6 +224,7 @@ pub async fn ensure_docs_are_cached_and_indexed(
                 target_dir.as_path(),
                 &project_path,
                 Arc::clone(&progress),
+                RUSTDOC_WORKSPACE_TIMEOUT,
             )
             .await
         {
@@ -167,87 +237,82 @@ pub async fn ensure_docs_are_cached_and_indexed(
                 .next()
                 .unwrap_or("unknown generation failure")
                 .to_string();
-            let mut progress_guard = progress.lock().await;
-            *progress_guard.failure_categories.entry(reason).or_insert(0) += 1;
-            progress_guard.failed_count += 1;
+            warn!(
+                "Workspace crate {} {} failed: {}",
+                package.name, package.version, reason
+            );
+            let mut pg = progress.lock().await;
+            *pg.failure_categories.entry(reason).or_insert(0) += 1;
+            pg.failed_count += 1;
             continue;
         }
 
         if cached_path.exists() {
-            json_paths.push((package.clone(), cached_path));
-            let mut progress_guard = progress.lock().await;
-            progress_guard.processed_count += 1;
+            if tx.send((package.clone(), cached_path)).await.is_err() {
+                warn!("Phase 2 consumer dropped; aborting Phase 1a");
+                break;
+            }
+            let mut pg = progress.lock().await;
+            pg.processed_count += 1;
         } else {
-            let mut progress_guard = progress.lock().await;
-            *progress_guard
-                .failure_categories
+            let mut pg = progress.lock().await;
+            *pg.failure_categories
                 .entry("json not found after generation".to_string())
                 .or_insert(0) += 1;
-            progress_guard.failed_count += 1;
+            pg.failed_count += 1;
         }
     }
 
+    // Phase 1b: Check cache for dependency crates (no doc generation).
+    info!(
+        "Phase 1b: Checking cache for {} dependency crates...",
+        dep_packages.len()
+    );
+    let mut dep_skipped = 0usize;
+    for package in &dep_packages {
+        let cached_path = cache_dir.join(doc_cache_filename(package));
+        if cached_path.exists() {
+            if tx.send((package.clone(), cached_path)).await.is_err() {
+                warn!("Phase 2 consumer dropped; aborting Phase 1b");
+                break;
+            }
+            let mut pg = progress.lock().await;
+            pg.processed_count += 1;
+        } else {
+            dep_skipped += 1;
+        }
+    }
+    if dep_skipped > 0 {
+        debug!(
+            "Skipped {} dependency crates without cached docs",
+            dep_skipped
+        );
+    }
+
+    // Close the channel so Phase 2 can finish.
+    drop(tx);
+
+    // Wait for Phase 2 to complete.
+    let indexed_count = match phase2.await {
+        Ok(count) => count,
+        Err(e) => {
+            warn!("Phase 2 indexing task failed: {e}");
+            0
+        }
+    };
+
     {
-        let progress_guard = progress.lock().await;
-        for (reason, count) in &progress_guard.failure_categories {
+        let mut pg = progress.lock().await;
+        pg.indexed_count = indexed_count;
+        for (reason, count) in &pg.failure_categories {
             warn!("{count} crates failed doc generation: {reason}");
         }
+        pg.current_crate = None;
     }
-
     info!(
-        "Phase 1 done: {} cached JSON files. Starting Phase 2 (DB indexing)...",
-        json_paths.len()
+        "All documentation is now cached and indexed ({} packages).",
+        indexed_count
     );
-
-    for (i, (package, json_path)) in json_paths.iter().enumerate() {
-        {
-            let mut progress_guard = progress.lock().await;
-            progress_guard.current_crate = Some(format!("{} {}", package.name, package.version));
-        }
-        let pkg_hash = package_id_hash(package);
-
-        info!(
-            "Phase 2 [{}/{}]: checking {} {}...",
-            i + 1,
-            json_paths.len(),
-            package.name,
-            package.version
-        );
-
-        let already_indexed = {
-            let hash = pkg_hash.clone();
-            db.call(move |conn| is_crate_indexed(conn, &hash)).await?
-        };
-
-        if already_indexed {
-            info!(
-                "docs: {} {} (already in global index)",
-                package.name, package.version
-            );
-            continue;
-        }
-
-        let should_idx = should_index_package(json_path, &pkg_hash)?;
-        if should_idx {
-            let version = package.version.to_string();
-            index_rustdoc_json(json_path, &db, &version, &pkg_hash).await?;
-            if let Err(e) = write_doc_meta(json_path, package, &pkg_hash) {
-                warn!(
-                    "Failed to write doc meta for {} {}: {}",
-                    package.name, package.version, e
-                );
-            }
-            info!("docs: {} {} (indexed)", package.name, package.version);
-        } else {
-            info!("docs: {} {} (up-to-date)", package.name, package.version);
-        }
-    }
-
-    {
-        let mut progress_guard = progress.lock().await;
-        progress_guard.current_crate = None;
-    }
-    info!("All documentation is now cached and indexed.");
     Ok(())
 }
 
@@ -344,7 +409,7 @@ fn extract_doc_item(
         _ => return None,
     };
 
-    let docs = item.docs.as_ref().filter(|d| !d.is_empty())?;
+    let docs = item.docs.as_deref().unwrap_or("");
     let item_name = item.name.clone()?;
 
     Some(DocItem {
@@ -353,27 +418,31 @@ fn extract_doc_item(
         package_id_hash: package_id_hash.to_string(),
         item_name,
         kind: kind.to_string(),
-        text: docs.clone(),
+        text: docs.to_string(),
     })
 }
 
-/// Returns the crate names and versions for packages reachable
-/// from a project's workspace members.
+/// Crate identity plus dependency depth (0 = workspace member, 1 = direct dep, …).
 pub struct ProjectCrate {
     pub name: String,
     pub version: String,
     pub package_id_hash: String,
+    pub depth: u32,
 }
 
 /// Returns package identity info for the project's dependency tree.
 pub fn project_crate_scopes(metadata: &Metadata) -> AppResult<Vec<ProjectCrate>> {
-    let packages = collect_index_packages(metadata)?;
+    let IndexPackages { packages, depths } = collect_index_packages(metadata)?;
     Ok(packages
         .iter()
-        .map(|pkg| ProjectCrate {
-            name: normalize_crate_name(&pkg.name),
-            version: pkg.version.to_string(),
-            package_id_hash: package_id_hash(pkg),
+        .map(|pkg| {
+            let depth = depths.get(&pkg.id).copied().unwrap_or(u32::MAX);
+            ProjectCrate {
+                name: normalize_crate_name(&pkg.name),
+                version: pkg.version.to_string(),
+                package_id_hash: package_id_hash(pkg),
+                depth,
+            }
         })
         .collect())
 }
@@ -383,6 +452,7 @@ async fn generate_docs_for_package(
     target_dir: &Utf8Path,
     project_path: &Path,
     progress: Arc<Mutex<ProjectProgress>>,
+    timeout: Duration,
 ) -> AppResult<()> {
     let package_spec = if package.source.is_some() {
         format!("{}@{}", package.name, package.version)
@@ -399,7 +469,7 @@ async fn generate_docs_for_package(
         .arg("--output-format")
         .arg("json");
 
-    let output = run_with_timeout(&mut cmd, RUSTDOC_TIMEOUT, "`cargo rustdoc`").await?;
+    let output = run_with_timeout(&mut cmd, timeout, "`cargo rustdoc`").await?;
     let cargo_warnings = extract_cargo_warnings(&output.stderr, "cargo rustdoc");
     if !cargo_warnings.is_empty() {
         progress.lock().await.merge_cargo_warnings(cargo_warnings);
@@ -482,10 +552,12 @@ pub fn package_id_hash(package: &Package) -> String {
     let mut hasher = Sha256::new();
     hasher.update(package.id.repr.as_bytes());
     let bytes = hasher.finalize();
-    bytes
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 fn should_index_package(cached_json: &Path, pkg_hash: &str) -> AppResult<bool> {
@@ -524,8 +596,16 @@ fn write_doc_meta(cached_json: &Path, package: &Package, pkg_hash: &str) -> AppR
     Ok(())
 }
 
+/// Packages reachable from workspace members, together with their BFS depth.
+pub struct IndexPackages {
+    pub packages: Vec<Package>,
+    /// Depth 0 = workspace member, 1 = direct dependency, 2+ = transitive.
+    pub depths: HashMap<PackageId, u32>,
+}
+
 /// Collect all packages reachable from workspace members (workspace + transitive deps).
-pub fn collect_index_packages(metadata: &Metadata) -> AppResult<Vec<Package>> {
+/// Also computes the minimum BFS depth for each package.
+pub fn collect_index_packages(metadata: &Metadata) -> AppResult<IndexPackages> {
     let resolve = metadata
         .resolve
         .as_ref()
@@ -536,14 +616,19 @@ pub fn collect_index_packages(metadata: &Metadata) -> AppResult<Vec<Package>> {
         node_by_id.insert(node.id.clone(), node);
     }
 
-    let mut queue: std::collections::VecDeque<PackageId> =
-        metadata.workspace_members.iter().cloned().collect();
-    let mut reachable: HashSet<PackageId> = HashSet::new();
+    let mut queue: VecDeque<(PackageId, u32)> = metadata
+        .workspace_members
+        .iter()
+        .map(|id| (id.clone(), 0))
+        .collect();
+    let mut depths: HashMap<PackageId, u32> = HashMap::new();
 
-    while let Some(id) = queue.pop_front() {
-        if !reachable.insert(id.clone()) {
-            continue;
+    while let Some((id, depth)) = queue.pop_front() {
+        if depths.contains_key(&id) {
+            continue; // Already visited at same or shorter depth (BFS guarantee).
         }
+        depths.insert(id.clone(), depth);
+
         let node = node_by_id
             .get(&id)
             .ok_or_else(|| anyhow::anyhow!("Missing resolve node for package {}", id))?;
@@ -553,8 +638,8 @@ pub fn collect_index_packages(metadata: &Metadata) -> AppResult<Vec<Package>> {
             node.dependencies.to_vec()
         };
         for dep_id in deps {
-            if !reachable.contains(&dep_id) {
-                queue.push_back(dep_id);
+            if !depths.contains_key(&dep_id) {
+                queue.push_back((dep_id, depth + 1));
             }
         }
     }
@@ -562,11 +647,11 @@ pub fn collect_index_packages(metadata: &Metadata) -> AppResult<Vec<Package>> {
     let packages = metadata
         .packages
         .iter()
-        .filter(|pkg| reachable.contains(&pkg.id))
+        .filter(|pkg| depths.contains_key(&pkg.id))
         .cloned()
         .collect::<Vec<_>>();
 
-    Ok(packages)
+    Ok(IndexPackages { packages, depths })
 }
 
 #[cfg(test)]

@@ -89,7 +89,9 @@ fn summarize_one(diag: &Value) -> Option<Value> {
         "level": level,
         "message": message,
     });
-    let obj = summary.as_object_mut().unwrap();
+    let obj = summary
+        .as_object_mut()
+        .expect("json! macro always produces an object");
     if let Some(code) = code {
         obj.insert("code".into(), Value::String(code.into()));
     }
@@ -208,11 +210,21 @@ pub fn summarize_outdated(raw: &Value) -> Vec<Value> {
 
     deps.iter()
         .map(|dep| {
+            let latest = dep
+                .get("latest")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let status = if latest == "Removed" {
+                "removed"
+            } else {
+                "outdated"
+            };
             serde_json::json!({
                 "name": dep.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
                 "current": dep.get("project").and_then(|v| v.as_str()).unwrap_or_default(),
-                "latest": dep.get("latest").and_then(|v| v.as_str()).unwrap_or_default(),
+                "latest": latest,
                 "kind": dep.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "status": status,
             })
         })
         .collect()

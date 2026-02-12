@@ -95,6 +95,9 @@ pub struct SearchDocsRequest<'a> {
     pub filter_crates: Option<Vec<String>>,
     pub filter_kinds: Option<Vec<String>>,
     pub mode: QueryMode,
+    /// Maximum dependency depth to include (0 = workspace only, 1 = + direct deps, …).
+    /// `None` means include all transitive dependencies.
+    pub max_depth: Option<u32>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -116,6 +119,8 @@ pub struct ProjectProgress {
     pub already_indexed: usize,
     pub processed_count: usize,
     pub failed_count: usize,
+    /// Number of crates that were actually indexed into the DB after both phases.
+    pub indexed_count: usize,
     pub current_crate: Option<String>,
     pub cargo_warnings: Vec<CargoWarning>,
     pub estimated_total_secs: Option<f64>,
@@ -139,6 +144,7 @@ impl ProjectProgress {
             already_indexed: 0,
             processed_count: 0,
             failed_count: 0,
+            indexed_count: 0,
             current_crate: None,
             cargo_warnings: Vec::new(),
             estimated_total_secs: None,
@@ -203,18 +209,37 @@ impl ProjectProgress {
     pub fn to_json(&self) -> serde_json::Value {
         let mut obj = serde_json::json!({
             "status": self.phase.status(),
-            "processed": self.completed(),
             "total": self.new_dependencies,
+            "indexed": self.indexed_count,
             "percent": self.percent(),
-            "eta_secs": self.eta_secs(),
         });
 
         let map = obj
             .as_object_mut()
             .expect("status JSON should always be an object");
-        if self.failed_count > 0 {
+
+        // During indexing, show progress ETA.
+        if let Some(eta) = self.eta_secs() {
+            map.insert("eta_secs".to_string(), serde_json::json!(eta));
+        }
+
+        // After indexing completes, report actual failures (crates missing from DB).
+        if matches!(self.phase, Phase::Ready) {
+            let actual_failed = self.new_dependencies.saturating_sub(self.indexed_count);
+            if actual_failed > 0 {
+                map.insert("failed".to_string(), serde_json::json!(actual_failed));
+            }
+        } else if self.failed_count > 0 {
             map.insert("failed".to_string(), serde_json::json!(self.failed_count));
         }
+
+        if !self.failure_categories.is_empty() {
+            map.insert(
+                "failure_reasons".to_string(),
+                serde_json::json!(self.failure_categories),
+            );
+        }
+
         if matches!(self.phase, Phase::Indexing)
             && let Some(current) = self.current_crate.as_ref()
         {
@@ -501,7 +526,7 @@ impl AppState {
                     Some(&e.to_string()),
                 )
             })?;
-        let index_packages = docs::collect_index_packages(&meta).map_err(|e| {
+        let index_result = docs::collect_index_packages(&meta).map_err(|e| {
             internal_tool_error(
                 "COLLECT_PACKAGES_FAILED",
                 "failed to collect dependency package list",
@@ -512,8 +537,11 @@ impl AppState {
                 Some(&e.to_string()),
             )
         })?;
-        let package_hashes: Vec<String> =
-            index_packages.iter().map(docs::package_id_hash).collect();
+        let package_hashes: Vec<String> = index_result
+            .packages
+            .iter()
+            .map(docs::package_id_hash)
+            .collect();
         let already_indexed = self
             .db
             .call(move |conn| {
@@ -538,7 +566,7 @@ impl AppState {
                 )
             })?;
 
-        let total_dependencies = index_packages.len();
+        let total_dependencies = index_result.packages.len();
         let new_dependencies = total_dependencies.saturating_sub(already_indexed);
         let estimated_total_secs = new_dependencies as f64 * 1.5;
 
@@ -901,7 +929,7 @@ impl AppState {
             raw_diagnostics,
             outdated_dependencies,
             security_advisories,
-            cargo_warning_count,
+            cargo_warnings,
             index_status,
         ) = {
             let project_guard = project.lock().await;
@@ -909,28 +937,43 @@ impl AppState {
             let outdated_dependencies = project_guard.outdated_dependencies.lock().await.clone();
             let security_advisories = project_guard.security_advisories.lock().await.clone();
             let progress_guard = project_guard.progress.lock().await;
+            let warnings: Vec<serde_json::Value> = progress_guard
+                .cargo_warnings
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "source": w.source,
+                        "message": w.message,
+                        "count": w.count,
+                    })
+                })
+                .collect();
             (
                 raw_diagnostics,
                 outdated_dependencies,
                 security_advisories,
-                progress_guard.cargo_warnings.len(),
+                warnings,
                 progress_guard.to_json(),
             )
         };
         let build_diagnostics = diagnostics::summarize_diagnostics(&raw_diagnostics);
         let outdated = diagnostics::summarize_outdated(&outdated_dependencies);
+        let outdated_actionable = outdated
+            .iter()
+            .filter(|d| d.get("status").and_then(|s| s.as_str()) != Some("removed"))
+            .count();
         let advisories = diagnostics::summarize_audit(&security_advisories);
         let combined_report = serde_json::json!({
             "project_path": resolve_project_path(project_path)?.display().to_string(),
             "index": index_status,
             "build": summarize_build_levels(&build_diagnostics),
             "outdated": {
-                "total": outdated.len(),
+                "total": outdated_actionable,
             },
             "security": {
                 "total": advisories.len(),
             },
-            "cargo_warning_count": cargo_warning_count,
+            "cargo_warnings": cargo_warnings,
         });
         let content = Content::json(combined_report)?;
         Ok(CallToolResult::success(vec![content]))
@@ -981,11 +1024,20 @@ impl AppState {
         project_path: &Path,
         limit: usize,
         offset: usize,
+        include_removed: bool,
     ) -> std::result::Result<CallToolResult, McpError> {
         let project = self.get_project(project_path).await?;
         let project_guard = project.lock().await;
         let raw = project_guard.outdated_dependencies.lock().await.clone();
-        let items = diagnostics::summarize_outdated(&raw);
+        let all_items = diagnostics::summarize_outdated(&raw);
+        let items: Vec<_> = if include_removed {
+            all_items
+        } else {
+            all_items
+                .into_iter()
+                .filter(|d| d.get("status").and_then(|s| s.as_str()) != Some("removed"))
+                .collect()
+        };
         let total = items.len();
         let page: Vec<_> = items.iter().skip(offset).take(limit).cloned().collect();
 
@@ -1030,6 +1082,7 @@ impl AppState {
             filter_crates,
             filter_kinds,
             mode,
+            max_depth,
             limit,
             offset,
         } = request;
@@ -1079,8 +1132,12 @@ impl AppState {
             let metadata = Arc::clone(&project_guard.metadata);
             drop(project_guard);
 
-            let crates = docs::project_crate_scopes(&metadata)
+            let mut crates = docs::project_crate_scopes(&metadata)
                 .mcp_internal_err("Failed to compute project crate scopes")?;
+            // Filter by max_depth when provided (default: include all).
+            if let Some(md) = max_depth {
+                crates.retain(|c| c.depth <= md);
+            }
             Some(crates)
         } else {
             None
@@ -1459,7 +1516,14 @@ impl ServerHandler for AppState {
                     let path = extract_project_path(&call.arguments)?;
                     let (limit, offset) =
                         extract_pagination(&call.arguments, DEFAULT_DETAIL_LIMIT, MAX_DETAIL_LIMIT);
-                    self.get_outdated_diagnostics(&path, limit, offset).await
+                    let include_removed = call
+                        .arguments
+                        .as_ref()
+                        .and_then(|a| a.get("include_removed"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    self.get_outdated_diagnostics(&path, limit, offset, include_removed)
+                        .await
                 }
                 "get_security_diagnostics" => {
                     let path = extract_project_path(&call.arguments)?;
@@ -1512,6 +1576,19 @@ impl ServerHandler for AppState {
                             .and_then(|args| args.get("mode"))
                             .and_then(|v| v.as_str()),
                     )?;
+                    // Default max_depth=1 (workspace + direct deps) when a
+                    // project_path is set and the caller didn't specify.
+                    // Pass null explicitly to search all transitive deps.
+                    let max_depth = match call
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("max_depth"))
+                    {
+                        Some(v) if v.is_null() => None,
+                        Some(v) => v.as_u64().map(|d| d as u32),
+                        None if project_path.is_some() => Some(1),
+                        None => None,
+                    };
                     let search_limit_cap = self.config.server.max_search_results.max(1);
                     let (limit, offset) =
                         extract_pagination(&call.arguments, search_limit_cap, search_limit_cap);
@@ -1521,6 +1598,7 @@ impl ServerHandler for AppState {
                         filter_crates,
                         filter_kinds,
                         mode,
+                        max_depth,
                         limit,
                         offset,
                     })
@@ -1702,10 +1780,9 @@ impl ServerHandler for AppState {
                                 "properties": {
                                     "project_path": { "type": "string" },
                                     "status": { "type": "string" },
-                                    "processed": { "type": "integer" },
+                                    "indexed": { "type": "integer" },
                                     "total": { "type": "integer" },
-                                    "percent": { "type": "integer" },
-                                    "eta_secs": { "type": ["number", "null"] }
+                                    "percent": { "type": "integer" }
                                 }
                             }
                         })),
@@ -1809,9 +1886,9 @@ impl ServerHandler for AppState {
                                 "build": { "type": "object" },
                                 "outdated": { "type": "object" },
                                 "security": { "type": "object" },
-                                "cargo_warning_count": { "type": "integer" }
+                                "cargo_warnings": { "type": "array" }
                             },
-                            "required": ["project_path", "index", "build", "outdated", "security", "cargo_warning_count"]
+                            "required": ["project_path", "index", "build", "outdated", "security", "cargo_warnings"]
                         })
                         .as_object()
                         .cloned()
@@ -1865,6 +1942,10 @@ impl ServerHandler for AppState {
                                 "type": "object",
                                 "properties": {
                                     "project_path": &project_path_prop,
+                                    "include_removed": {
+                                        "type": "boolean",
+                                        "description": "Include deps where latest is 'Removed' (default: false)"
+                                    },
                                     "limit": pagination_props["limit"],
                                     "offset": pagination_props["offset"],
                                 },
@@ -1952,6 +2033,10 @@ impl ServerHandler for AppState {
                                         "type": "string",
                                         "enum": ["auto", "text", "symbol"],
                                         "description": "Query parser mode"
+                                    },
+                                    "max_depth": {
+                                        "type": ["integer", "null"],
+                                        "description": "Max dependency depth (0=workspace, 1=+direct deps). Default 1 when project_path is set. Null=all transitive deps."
                                     },
                                     "limit": search_pagination_props["limit"],
                                     "offset": search_pagination_props["offset"],
@@ -2409,16 +2494,16 @@ mod tests {
         progress.estimated_total_secs = Some(100.0);
         progress.new_dependencies = 10;
 
-        // During Metadata phase, eta_secs should be null
+        // During Metadata phase, eta_secs should be absent
         progress.phase = Phase::Metadata;
         let json = progress.to_json();
-        assert!(json["eta_secs"].is_null());
+        assert!(json.get("eta_secs").is_none());
         assert_eq!(json["status"], "queued");
 
-        // During Check phase, eta_secs should be null
+        // During Check phase, eta_secs should be absent
         progress.phase = Phase::Check;
         let json = progress.to_json();
-        assert!(json["eta_secs"].is_null());
+        assert!(json.get("eta_secs").is_none());
         assert_eq!(json["status"], "queued");
 
         // During Indexing phase with remaining work, eta_secs should be a number
@@ -2431,8 +2516,7 @@ mod tests {
         progress.processed_count = 8;
         progress.failed_count = 2;
         let json = progress.to_json();
-        assert!(json["eta_secs"].is_null());
-        assert_eq!(json["processed"], 10);
+        assert!(json.get("eta_secs").is_none() || json["eta_secs"].is_null());
         assert_eq!(json["total"], 10);
     }
 
@@ -2509,6 +2593,7 @@ mod tests {
                 filter_crates: None,
                 filter_kinds: None,
                 mode: QueryMode::Auto,
+                max_depth: None,
                 limit: DEFAULT_PAGE_LIMIT,
                 offset: 0,
             })
@@ -2556,6 +2641,7 @@ mod tests {
                 filter_crates: Some(vec!["serde".to_string()]),
                 filter_kinds: None,
                 mode: QueryMode::Auto,
+                max_depth: None,
                 limit: DEFAULT_PAGE_LIMIT,
                 offset: 0,
             })
@@ -2597,6 +2683,7 @@ mod tests {
                 filter_crates: None,
                 filter_kinds: None,
                 mode: QueryMode::Auto,
+                max_depth: None,
                 limit: 50,
                 offset: 0,
             })
@@ -2614,6 +2701,7 @@ mod tests {
                 filter_crates: None,
                 filter_kinds: None,
                 mode: QueryMode::Auto,
+                max_depth: None,
                 limit: 50,
                 offset: 3,
             })
@@ -2977,6 +3065,7 @@ mod tests {
                 filter_crates: None,
                 filter_kinds: None,
                 mode: QueryMode::Auto,
+                max_depth: None,
                 limit: DEFAULT_PAGE_LIMIT,
                 offset: 0,
             })
