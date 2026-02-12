@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="cratedex logo" width="400">
+  <img src="logo.png" alt="cratedex logo" width="297">
 </p>
 
 # cratedex
