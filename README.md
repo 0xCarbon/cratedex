@@ -1,4 +1,11 @@
+<p align="center">
+  <img src="logo.png" alt="cratedex logo" width="400">
+</p>
+
 # cratedex
+
+[![Crates.io](https://img.shields.io/crates/v/cratedex)](https://crates.io/crates/cratedex)
+[![License](https://img.shields.io/crates/l/cratedex)](LICENSE-MIT)
 
 MCP (Model Context Protocol) server for Rust documentation indexing, full-text search, and project diagnostics.
 
