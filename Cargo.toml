@@ -1,0 +1,38 @@
+[package]
+name = "cratedex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+description = "MCP server for Rust documentation indexing, full-text search, and project diagnostics"
+repository = "https://github.com/0xCarbon/cratedex"
+keywords = ["mcp", "rust", "documentation", "diagnostics", "cargo"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+rmcp = { version = "0.15", features = ["transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1.49.0", features = ["full"] }
+clap = { version = "4.5.56", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["unbounded_depth"] }
+serde_stacker = "0.1"
+cargo_metadata = "0.23.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+anyhow = "1.0.100"
+thiserror = "2.0.18"
+futures = "0.3.31"
+dirs = "6.0.0"
+rustdoc-types = "0.57.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "8.2.0"
+config = { version = "0.15.19", features = ["toml"] }
+sha2 = "0.10"
+axum = "0.8.8"
+tower = { version = "0.5.2", features = ["limit"] }
+tower-http = { version = "0.6.2", features = ["auth", "limit"] }
+governor = "0.10.1"
+
+[dev-dependencies]
+serial_test = "3.3.1"
+tempfile = "3"

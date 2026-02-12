@@ -1,0 +1,54 @@
+# Configuration file for cratedex
+# Copy this file to cratedex.toml and adjust the values as needed
+# You can also override these settings with environment variables prefixed with CRATEDEX
+# Use double underscores to denote nesting, e.g.:
+#   CRATEDEX__SERVER__MAX_SEARCH_RESULTS=25
+#   CRATEDEX__DATABASE__PATH=/tmp/cratedex.db
+
+# Database configuration
+[database]
+# Local path to the SQLite database file
+# If not specified, defaults to ~/.cratedex/cratedex.db
+# path = "/path/to/custom/cratedex.db"
+
+# Prefix for per-project documentation tables.
+table_name = "docs"
+
+# Server configuration
+[server]
+# Maximum number of search results to return
+max_search_results = 10
+
+# Enable verbose logging
+verbose = false
+
+# Transport: "http" or "stdio" (default: http)
+transport = "http"
+
+# HTTP bind host and port
+host = "127.0.0.1"
+port = 3737
+
+# SECURITY: by default cratedex refuses non-loopback binds.
+# Set to true only when using a reverse proxy with TLS + authentication.
+allow_remote = false
+
+# Optional bearer token for HTTP clients.
+# If set, requests must include:
+#   Authorization: Bearer <token>
+# auth_token = "change-me"
+
+# Operational safety limits
+max_projects = 32
+max_concurrent_requests = 64
+rate_limit_per_sec = 30
+max_request_body_bytes = 262144
+
+# File watching configuration
+[watcher]
+# Enable file watching for live diagnostics
+enabled = true
+
+# Debounce delay in milliseconds
+# This prevents running diagnostics too frequently during rapid file saves
+debounce_ms = 300

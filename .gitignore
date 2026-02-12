@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coder workflow artifacts
+.coder/
+.coder-worktrees/
+.mcp.json
