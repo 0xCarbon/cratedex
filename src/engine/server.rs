@@ -124,18 +124,18 @@ impl ProjectProgress {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        let processed = self.processed_count.saturating_add(self.failed_count);
-        let percent = if self.total_dependencies == 0 {
-            100
-        } else {
-            ((processed * 100) / self.total_dependencies).min(100)
-        };
-        let elapsed_secs = self.started_at.elapsed().as_secs_f64();
-        // Only compute remaining estimate during indexing — the estimate covers
-        // indexing time only, so it's meaningless during metadata/check phases.
+        // Estimate remaining time from actual throughput during indexing.
         let estimated_remaining_secs = if matches!(self.phase, Phase::Indexing) {
-            self.estimated_total_secs
-                .map(|total| (total - elapsed_secs).max(0.0))
+            let done = self.processed_count + self.failed_count;
+            let remaining = self.new_dependencies.saturating_sub(done);
+            if done > 0 {
+                let elapsed = self.started_at.elapsed().as_secs_f64();
+                let per_crate = elapsed / done as f64;
+                Some(per_crate * remaining as f64)
+            } else {
+                // No data yet — fall back to static estimate
+                self.estimated_total_secs
+            }
         } else {
             None
         };
@@ -145,18 +145,12 @@ impl ProjectProgress {
         };
         serde_json::json!({
             "phase": self.phase.as_str(),
-            "progress": {
-                "processed": self.processed_count,
-                "failed": self.failed_count,
-                "total": self.total_dependencies,
-                "percent": percent
-            },
-            "total_dependencies": self.total_dependencies,
+            "processed": self.processed_count,
+            "failed": self.failed_count,
+            "total": self.total_dependencies,
             "new_dependencies": self.new_dependencies,
             "already_indexed": self.already_indexed,
             "current_crate": self.current_crate,
-            "elapsed_secs": elapsed_secs,
-            "estimated_total_secs": self.estimated_total_secs,
             "estimated_remaining_secs": estimated_remaining_secs,
             "cargo_warnings": self.cargo_warnings,
             "failed_message": failed_message
@@ -465,15 +459,10 @@ impl AppState {
             let guard = project.lock().await;
             guard.progress.lock().await.to_json()
         };
-        let content = json_content(serde_json::json!({
-            "status": "registered",
-            "project_path": canonical.display().to_string(),
-            "total_dependencies": total_dependencies,
-            "new_dependencies": new_dependencies,
-            "already_indexed": already_indexed,
-            "estimated_index_time_secs": estimated_total_secs,
-            "project_progress": project_progress,
-        }))?;
+        let mut response = project_progress;
+        response["status"] = serde_json::json!("registered");
+        response["project_path"] = serde_json::json!(canonical.display().to_string());
+        let content = json_content(response)?;
         Ok(CallToolResult::success(vec![content]))
     }
 
@@ -985,11 +974,11 @@ impl ServerHandler for AppState {
                             "properties": {
                                 "status": { "type": "string" },
                                 "project_path": { "type": "string" },
-                                "total_dependencies": { "type": "integer" },
+                                "phase": { "type": "string" },
+                                "total": { "type": "integer" },
                                 "new_dependencies": { "type": "integer" },
                                 "already_indexed": { "type": "integer" },
-                                "estimated_index_time_secs": { "type": "number" },
-                                "project_progress": { "type": "object" }
+                                "estimated_remaining_secs": { "type": ["number", "null"] }
                             },
                             "required": ["status", "project_path"]
                         })
@@ -1030,16 +1019,9 @@ impl ServerHandler for AppState {
                                 "properties": {
                                     "project_path": { "type": "string" },
                                     "phase": { "type": "string" },
-                                    "progress": {
-                                        "type": "object",
-                                        "properties": {
-                                            "processed": { "type": "integer" },
-                                            "failed": { "type": "integer" },
-                                            "total": { "type": "integer" },
-                                            "percent": { "type": "integer" }
-                                        }
-                                    },
-                                    "elapsed_secs": { "type": "number" },
+                                    "processed": { "type": "integer" },
+                                    "failed": { "type": "integer" },
+                                    "total": { "type": "integer" },
                                     "estimated_remaining_secs": { "type": ["number", "null"] },
                                     "cargo_warnings": { "type": "array" },
                                     "diagnostics_count": { "type": "integer" }
