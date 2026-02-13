@@ -38,6 +38,77 @@ fn current_exec_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from(SERVICE_NAME))
 }
 
+pub fn installed_services() -> Vec<ServiceInstallScope> {
+    let mut scopes = Vec::new();
+    let current_user = ServiceInstallScope::CurrentUser;
+    let system = ServiceInstallScope::System {
+        run_as: String::new(),
+    };
+
+    if is_service_installed(&current_user) {
+        scopes.push(current_user);
+    }
+    if is_service_installed(&system) {
+        scopes.push(system);
+    }
+
+    scopes
+}
+
+#[allow(clippy::needless_return)]
+pub fn restart_service(scope: &ServiceInstallScope) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::restart_service(scope);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos::restart_service(scope);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows::restart_service(scope);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = scope;
+        anyhow::bail!("Service management is not supported on this platform");
+    }
+}
+
+#[allow(clippy::needless_return)]
+pub fn refresh_system_binary() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::refresh_system_binary();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("System service binary refresh is only implemented for Linux.");
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_service_installed(scope: &ServiceInstallScope) -> bool {
+    linux::service_is_installed(scope)
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_service_installed(scope: &ServiceInstallScope) -> bool {
+    macos::service_is_installed(scope)
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_service_installed(scope: &ServiceInstallScope) -> bool {
+    windows::service_is_installed(scope)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn is_service_installed(_scope: &ServiceInstallScope) -> bool {
+    false
+}
+
 #[allow(clippy::needless_return)]
 pub fn install_service(
     host: &str,

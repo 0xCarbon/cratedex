@@ -1,4 +1,6 @@
 use super::{SERVICE_NAME, ServiceConfig, ServiceInstallScope, ServiceManager, require_root};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -14,7 +16,15 @@ impl ServiceManager for LinuxServiceManager {
         }
 
         let path = service_file_path(&config.scope)?;
-        let exec_start = config.exec_path.to_string_lossy().to_string();
+        let exec_start = if let ServiceInstallScope::System { .. } = &config.scope {
+            require_root(
+                "install-service --system",
+                &config.exec_path.to_string_lossy(),
+            )?;
+            ensure_system_binary(&config.exec_path)?
+        } else {
+            config.exec_path.to_string_lossy().to_string()
+        };
 
         let content = match &config.scope {
             ServiceInstallScope::System { run_as } => system_service_unit_content(
@@ -28,10 +38,6 @@ impl ServiceManager for LinuxServiceManager {
                 service_unit_content(&exec_start, &config.host, config.port, config.allow_remote)
             }
         };
-
-        if let ServiceInstallScope::System { .. } = &config.scope {
-            require_root("install-service --system", &exec_start)?;
-        }
 
         let needs_write = match std::fs::read_to_string(&path) {
             Ok(existing) => existing != content,
@@ -132,6 +138,80 @@ Check status with: systemctl status {SERVICE_NAME}"
 
         Ok(())
     }
+}
+
+pub(crate) fn service_is_installed(scope: &ServiceInstallScope) -> bool {
+    match service_file_path(scope) {
+        Ok(path) => path.exists(),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn restart_service(scope: &ServiceInstallScope) -> anyhow::Result<()> {
+    match scope {
+        ServiceInstallScope::CurrentUser => {
+            systemctl_user(&["restart", SERVICE_NAME])?;
+            eprintln!("Restarted current-user service {SERVICE_NAME}.");
+        }
+        ServiceInstallScope::System { .. } => {
+            require_root("restart-service --system", "/usr/local/bin/cratedex")?;
+            systemctl_system(&["restart", SERVICE_NAME])?;
+            eprintln!("Restarted system service {SERVICE_NAME}.");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn refresh_system_binary() -> anyhow::Result<()> {
+    let source = cargo_install_binary()?;
+    let _ = ensure_system_binary(&source)?;
+    Ok(())
+}
+
+fn ensure_system_binary(source: &std::path::Path) -> anyhow::Result<String> {
+    let target = PathBuf::from("/usr/local/bin/cratedex");
+    if source == target {
+        eprintln!("System service already targets {target:?}");
+        return Ok(target.to_string_lossy().to_string());
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if target.exists() || target.is_symlink() {
+        std::fs::remove_file(&target)?;
+    }
+    if let Err(err) = symlink(source, &target) {
+        eprintln!("Could not create symlink for system binary ({err}); falling back to copy");
+        let _ = std::fs::copy(source, &target)?;
+        // Only chmod the copy — symlinks inherit source permissions.
+        let metadata = std::fs::metadata(&target)?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms)?;
+        eprintln!("Copied binary to {}", target.display());
+    } else {
+        eprintln!("Linked {} -> {}", target.display(), source.display());
+    }
+    Ok(target.to_string_lossy().to_string())
+}
+
+fn cargo_install_binary() -> anyhow::Result<PathBuf> {
+    let cargo_home = std::env::var("CARGO_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")));
+    let cargo_home = cargo_home.ok_or_else(|| {
+        anyhow::anyhow!("Could not resolve cargo home for refreshing system binary")
+    })?;
+    let binary = cargo_home.join("bin").join("cratedex");
+    if !binary.exists() {
+        anyhow::bail!(
+            "Expected updated cargo binary at {}, but it does not exist.",
+            binary.display()
+        );
+    }
+    Ok(binary)
 }
 
 fn systemd_quote_arg(s: &str) -> String {

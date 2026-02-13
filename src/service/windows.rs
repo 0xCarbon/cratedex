@@ -66,6 +66,32 @@ Use NSSM (https://nssm.cc/) to run cratedex as a Windows Service."
     }
 }
 
+pub(crate) fn service_is_installed(scope: &ServiceInstallScope) -> bool {
+    if matches!(scope, ServiceInstallScope::System { .. }) {
+        return false;
+    }
+    task_script_path().map_or(false, |path| path.exists())
+}
+
+pub(crate) fn restart_service(scope: &ServiceInstallScope) -> anyhow::Result<()> {
+    if matches!(scope, ServiceInstallScope::System { .. }) {
+        anyhow::bail!("System-level service restart on Windows is not implemented by cratedex.");
+    }
+
+    let _ = Command::new("schtasks")
+        .args(["/end", "/tn", TASK_NAME])
+        .status();
+    let status = Command::new("schtasks")
+        .args(["/run", "/tn", TASK_NAME])
+        .status()?;
+    if status.success() {
+        eprintln!("Task Scheduler entry {TASK_NAME} restarted.");
+        Ok(())
+    } else {
+        anyhow::bail!("schtasks /run failed (exit {status})");
+    }
+}
+
 fn task_script_path() -> anyhow::Result<PathBuf> {
     if let Ok(app_data) = std::env::var("APPDATA")
         && !app_data.trim().is_empty()

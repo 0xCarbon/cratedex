@@ -60,6 +60,22 @@ impl ServiceManager for MacosServiceManager {
     }
 }
 
+pub(crate) fn service_is_installed(scope: &ServiceInstallScope) -> bool {
+    plist_path(scope).map(|path| path.exists()).unwrap_or(false)
+}
+
+pub(crate) fn restart_service(scope: &ServiceInstallScope) -> anyhow::Result<()> {
+    if matches!(scope, ServiceInstallScope::System { .. }) {
+        require_root("restart-service --system", "cratedex")?;
+    }
+
+    let path = plist_path(scope)?.to_string_lossy().to_string();
+    let _ = run_launchctl(&["unload", "-w", &path]);
+    run_launchctl(&["load", "-w", &path])?;
+    eprintln!("Restarted {SERVICE_NAME} launchd service.");
+    Ok(())
+}
+
 fn plist_path(scope: &ServiceInstallScope) -> anyhow::Result<PathBuf> {
     match scope {
         ServiceInstallScope::CurrentUser => {

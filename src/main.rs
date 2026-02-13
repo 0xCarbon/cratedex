@@ -40,6 +40,46 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Update { system } => {
+            init_simple_tracing();
+
+            let mut cmd = tokio::process::Command::new("cargo");
+            cmd.args(["install", "cratedex"]);
+            match cmd.status().await {
+                Ok(status) if status.success() => eprintln!("Updated cratedex package"),
+                Ok(status) => anyhow::bail!("cargo install cratedex failed (exit {status})"),
+                Err(e) => anyhow::bail!("Failed to run cargo install: {e}"),
+            };
+
+            let scopes = if system {
+                let scope = service::ServiceInstallScope::System {
+                    run_as: String::new(),
+                };
+                if !service::is_service_installed(&scope) {
+                    anyhow::bail!(
+                        "No system-level service is installed. \
+                         Install one first with `sudo cratedex install-service --system`."
+                    );
+                }
+                vec![scope]
+            } else {
+                service::installed_services()
+            };
+
+            if scopes.is_empty() {
+                eprintln!("No cratedex service detected; skipping service refresh.");
+                eprintln!(
+                    "Install one with `cratedex install-service` if you want updates to restart it."
+                );
+            } else {
+                for scope in scopes {
+                    if matches!(scope, service::ServiceInstallScope::System { .. }) {
+                        service::refresh_system_binary()?;
+                    }
+                    service::restart_service(&scope)?;
+                }
+            }
+        }
         Commands::InstallService {
             host,
             port,

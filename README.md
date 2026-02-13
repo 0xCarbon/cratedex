@@ -17,6 +17,12 @@ MCP (Model Context Protocol) server for Rust documentation indexing, full-text s
 cargo install cratedex
 ```
 
+To upgrade later:
+
+```bash
+cratedex update
+```
+
 2. Run as a background service (Linux user service):
 
 ```bash
@@ -171,12 +177,23 @@ To remove:
 cratedex remove-service
 ```
 
+To update the service binary:
+
+```bash
+cratedex update
+```
+
+For system-level services:
+
+```bash
+sudo cratedex update --system
+```
+
 ### Linux: systemd System Service
 
 A system-level service runs a shared daemon under `/etc/systemd/system`, managed with plain `systemctl`.
 
 ```bash
-sudo install -m 0755 "$(which cratedex)" /usr/local/bin/cratedex
 sudo cratedex install-service --system
 ```
 

@@ -22,6 +22,12 @@ pub enum Commands {
     Server,
     /// Installs optional prerequisites like cargo-outdated and cargo-audit.
     Setup,
+    /// Update cratedex to the latest published version and refresh installed services.
+    Update {
+        /// Refresh only the system-level service (Linux/macOS). Defaults to auto-detecting installed services.
+        #[arg(long)]
+        system: bool,
+    },
     /// Install cratedex as a background service (HTTP transport).
     InstallService {
         /// HTTP bind address.
