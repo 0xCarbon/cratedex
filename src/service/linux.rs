@@ -179,7 +179,12 @@ fn ensure_system_binary(source: &std::path::Path) -> anyhow::Result<String> {
         std::fs::create_dir_all(parent)?;
     }
     if target.exists() || target.is_symlink() {
-        std::fs::remove_file(&target)?;
+        std::fs::remove_file(&target).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to remove {}: {e}. Re-run with sudo for system service updates.",
+                target.display()
+            )
+        })?;
     }
     if let Err(err) = symlink(source, &target) {
         eprintln!("Could not create symlink for system binary ({err}); falling back to copy");

@@ -72,11 +72,21 @@ async fn main() -> Result<()> {
                     "Install one with `cratedex install-service` if you want updates to restart it."
                 );
             } else {
-                for scope in scopes {
+                for scope in &scopes {
+                    if matches!(scope, service::ServiceInstallScope::System { .. }) && !system {
+                        // Auto-detected a system service but not running with --system;
+                        // skip it rather than failing on permission errors.
+                        eprintln!(
+                            "System service detected but running without --system; \
+                             skipping system binary refresh.\n\
+                             To update the system service, re-run: sudo cratedex update --system"
+                        );
+                        continue;
+                    }
                     if matches!(scope, service::ServiceInstallScope::System { .. }) {
                         service::refresh_system_binary()?;
                     }
-                    service::restart_service(&scope)?;
+                    service::restart_service(scope)?;
                 }
             }
         }
