@@ -97,10 +97,10 @@ fn format_iso8601_utc(time: std::time::SystemTime) -> String {
     // civil_from_days: convert days since Unix epoch to (year, month, day).
     // Reference: https://howardhinnant.github.io/date_algorithms.html
     let days = (secs / 86400) as i64;
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u64; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn format_iso8601_utc_produces_valid_timestamp() {
-        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1749997800);
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_749_997_800);
         assert_eq!(format_iso8601_utc(time), "2025-06-15T14:30:00Z");
     }
 

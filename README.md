@@ -100,9 +100,14 @@ See `cratedex.toml.example` for all options. Key environment variables:
 | Tool | Description |
 |---|---|
 | `register_project` | Register a Rust project for indexing and diagnostics |
+| `reindex_project` | Restart indexing for an existing project |
 | `list_projects` | List all registered projects and their indexing status |
+| `get_index_status` | Get indexing status for one project |
 | `list_crates` | List all crates in a project's workspace |
-| `get_diagnostics` | Get build diagnostics, outdated deps, and security advisories |
+| `get_diagnostics` | Compact diagnostics summary |
+| `get_build_diagnostics` | Paginated build diagnostics |
+| `get_outdated_diagnostics` | Paginated outdated dependencies |
+| `get_security_diagnostics` | Paginated security advisories |
 | `search_docs` | Search Rust documentation across the global index |
 | `unregister_project` | Remove a registered project from the server |
 

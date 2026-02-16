@@ -3,6 +3,6 @@ fn main() {
     // to construct architecture-correct rustup toolchain paths.
     println!(
         "cargo::rustc-env=TARGET={}",
-        std::env::var("TARGET").unwrap()
+        std::env::var("TARGET").expect("TARGET env var must be set by cargo")
     );
 }

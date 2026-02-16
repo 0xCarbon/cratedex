@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 /// Main configuration structure for the application
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Database configuration
     pub database: DatabaseConfig,
@@ -18,6 +19,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     /// Local path to the SQLite database file.
     ///
@@ -33,6 +35,7 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Maximum number of search results to return
     #[serde(default = "default_max_results")]
@@ -91,6 +94,7 @@ pub enum Transport {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct WatcherConfig {
     /// Enable file watching for live diagnostics
     #[serde(default = "default_enabled")]
@@ -275,6 +279,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    #[allow(unsafe_code)]
     fn env_overrides_work() {
         // Environment overrides use prefix CRATEDEX_
         unsafe { std::env::set_var("CRATEDEX__SERVER__MAX_SEARCH_RESULTS", "5") };

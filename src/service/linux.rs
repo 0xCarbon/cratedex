@@ -171,7 +171,7 @@ pub(crate) fn refresh_system_binary() -> anyhow::Result<()> {
 fn ensure_system_binary(source: &std::path::Path) -> anyhow::Result<String> {
     let target = PathBuf::from("/usr/local/bin/cratedex");
     if source == target {
-        eprintln!("System service already targets {target:?}");
+        eprintln!("System service already targets {}", target.display());
         return Ok(target.to_string_lossy().to_string());
     }
 
@@ -236,7 +236,7 @@ fn systemd_quote_arg(s: &str) -> String {
 fn service_unit_content(exec_start: &str, host: &str, port: u16, allow_remote: bool) -> String {
     let exec_start = systemd_quote_arg(exec_start);
     format!(
-        r#"[Unit]
+        r"[Unit]
 Description=Cratedex shared HTTP server
 After=network-online.target
 Wants=network-online.target
@@ -271,7 +271,7 @@ TasksMax=512
 
 [Install]
 WantedBy=default.target
-"#
+"
     )
 }
 
@@ -287,7 +287,7 @@ fn system_service_unit_content(
     let home_dir = home_dir.to_string_lossy();
     let target_triple = env!("TARGET");
     Ok(format!(
-        r#"[Unit]
+        r"[Unit]
 Description=Cratedex shared HTTP server
 After=network-online.target
 Wants=network-online.target
@@ -325,7 +325,7 @@ TasksMax=512
 
 [Install]
 WantedBy=multi-user.target
-"#
+"
     ))
 }
 

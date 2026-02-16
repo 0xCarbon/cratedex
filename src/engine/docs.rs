@@ -63,13 +63,13 @@ pub fn ensure_docs_table_and_fts(conn: &Connection) -> AppResult<()> {
     if needs_recreate {
         info!("Detected old docs schema, recreating tables...");
         conn.execute_batch(
-            r#"
+            r"
             DROP TRIGGER IF EXISTS docs_ai;
             DROP TRIGGER IF EXISTS docs_ad;
             DROP TRIGGER IF EXISTS docs_au;
             DROP TABLE IF EXISTS docs_fts;
             DROP TABLE IF EXISTS docs;
-            "#,
+            ",
         )?;
     }
 
@@ -1143,6 +1143,7 @@ fn extract_all_items(
                     text: docs.to_string(),
                 });
             }
+            // ItemEnum has many variants we don't index (ExternCrate, Import, etc.)
             _ => {}
         }
     }
@@ -1226,6 +1227,7 @@ fn extract_all_items(
                         text: member_docs.to_string(),
                     });
                 }
+                // Only methods, assoc types, and assoc consts are relevant in impl blocks
                 _ => {}
             }
         }
@@ -1535,7 +1537,7 @@ mod tests {
         let (crate_name, item_name, score) = db
             .call(|conn| {
                 let mut stmt = conn.prepare(
-                    r#"
+                    r"
                     SELECT d.crate_name, d.item_name,
                            bm25(docs_fts, 1.0, 3.0, 2.0, 1.5, 1.0) as score
                     FROM docs_fts
@@ -1543,7 +1545,7 @@ mod tests {
                     WHERE docs_fts MATCH ?1
                     ORDER BY score ASC
                     LIMIT 10
-                    "#,
+                    ",
                 )?;
                 let result = stmt.query_row(params!["task"], |row| {
                     Ok((
@@ -1657,13 +1659,13 @@ mod tests {
         let results = db
             .call(|conn| {
                 let mut stmt = conn.prepare(
-                    r#"
+                    r"
                     SELECT d.item_name, d.parent_name
                     FROM docs_fts
                     JOIN docs d ON d.id = docs_fts.rowid
                     WHERE docs_fts MATCH 'insert'
                     AND d.parent_name = 'HashMap'
-                    "#,
+                    ",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
@@ -1701,12 +1703,12 @@ mod tests {
         let results = db
             .call(|conn| {
                 let mut stmt = conn.prepare(
-                    r#"
+                    r"
                     SELECT d.item_name, d.signature
                     FROM docs_fts
                     JOIN docs d ON d.id = docs_fts.rowid
                     WHERE docs_fts MATCH 'JoinHandle'
-                    "#,
+                    ",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {

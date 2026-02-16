@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
                 Ok(status) if status.success() => eprintln!("Updated cratedex package"),
                 Ok(status) => anyhow::bail!("cargo install cratedex failed (exit {status})"),
                 Err(e) => anyhow::bail!("Failed to run cargo install: {e}"),
-            };
+            }
 
             let scopes = if system {
                 let scope = service::ServiceInstallScope::System {

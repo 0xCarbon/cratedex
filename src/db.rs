@@ -45,7 +45,7 @@ impl Db {
                         warn!(
                             attempt = attempt + 1,
                             max_retries,
-                            delay_ms = delay.as_millis() as u64,
+                            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                             error = %e,
                             "Failed to open database, retrying..."
                         );
@@ -67,7 +67,7 @@ impl Db {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().unwrap();
+            let guard = conn.lock().expect("db mutex poisoned");
             f(&guard)
         })
         .await?
@@ -81,7 +81,7 @@ impl Db {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = conn.lock().unwrap();
+            let mut guard = conn.lock().expect("db mutex poisoned");
             f(&mut guard)
         })
         .await?

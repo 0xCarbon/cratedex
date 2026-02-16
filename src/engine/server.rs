@@ -346,13 +346,13 @@ fn extract_pagination(
         .as_ref()
         .and_then(|a| a.get("limit"))
         .and_then(|v| v.as_u64())
-        .map(|v| (v as usize).min(max_limit).max(1))
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX).min(max_limit).max(1))
         .unwrap_or(default_limit);
     let offset = args
         .as_ref()
         .and_then(|a| a.get("offset"))
         .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
         .unwrap_or(0);
     (limit, offset)
 }
@@ -615,7 +615,7 @@ impl AppState {
             tokio::spawn(async move {
                 tokio::select! {
                     _ = abort.changed() => {}
-                    _ = diagnostics::run_outdated_on_startup(outdated_cache, &proj_path, progress) => {}
+                    () = diagnostics::run_outdated_on_startup(outdated_cache, &proj_path, progress) => {}
                 }
             });
 
@@ -626,7 +626,7 @@ impl AppState {
             tokio::spawn(async move {
                 tokio::select! {
                     _ = abort.changed() => {}
-                    _ = diagnostics::run_audit_on_startup(audit_cache, &proj_path, progress) => {}
+                    () = diagnostics::run_audit_on_startup(audit_cache, &proj_path, progress) => {}
                 }
             });
         }
@@ -652,7 +652,7 @@ impl AppState {
 
                 tokio::select! {
                     _ = abort_check_docs.changed() => { return; }
-                    _ = diagnostics::run_check_on_startup(diag_cache, &path, Arc::clone(&progress)) => {}
+                    () = diagnostics::run_check_on_startup(diag_cache, &path, Arc::clone(&progress)) => {}
                 }
             }
 
@@ -1232,7 +1232,7 @@ impl AppState {
         param_values.push(Box::new(sql_limit as i64));
 
         let sql = format!(
-            r#"
+            r"
             SELECT
                 d.crate_name,
                 d.crate_version,
@@ -1250,7 +1250,7 @@ impl AppState {
             {extra_where}
             ORDER BY score ASC, d.crate_name ASC, d.item_name ASC
             LIMIT ?{limit_param_idx}
-            "#
+            "
         );
 
         let all_results = match self
