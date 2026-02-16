@@ -38,22 +38,44 @@ impl LogCaptureLayer {
     }
 }
 
-/// Visitor that extracts the message field from a tracing event.
-struct MessageVisitor {
+/// Visitor that extracts the message and all structured fields from a tracing event.
+struct EventVisitor {
     message: String,
+    fields: Vec<(String, String)>,
 }
 
-impl Visit for MessageVisitor {
+impl Visit for EventVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{:?}", value);
+        } else {
+            self.fields
+                .push((field.name().to_string(), format!("{:?}", value)));
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
             self.message = value.to_string();
+        } else {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
         }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .push((field.name().to_string(), value.to_string()));
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .push((field.name().to_string(), value.to_string()));
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .push((field.name().to_string(), value.to_string()));
     }
 }
 
@@ -94,15 +116,26 @@ fn format_iso8601_utc(time: std::time::SystemTime) -> String {
 
 impl<S: Subscriber> Layer<S> for LogCaptureLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let mut visitor = MessageVisitor {
+        let mut visitor = EventVisitor {
             message: String::new(),
+            fields: Vec::new(),
         };
         event.record(&mut visitor);
 
         let timestamp = format_iso8601_utc(std::time::SystemTime::now());
-
         let level = event.metadata().level();
-        let line = truncate_log_line(format!("{} {} {}", timestamp, level, visitor.message));
+
+        let line = if visitor.fields.is_empty() {
+            format!("{timestamp} {level} {}", visitor.message)
+        } else {
+            use std::fmt::Write;
+            let mut buf = format!("{timestamp} {level} {}", visitor.message);
+            for (key, val) in &visitor.fields {
+                write!(buf, " {key}={val}").unwrap();
+            }
+            buf
+        };
+        let line = truncate_log_line(line);
 
         if let Ok(mut buf) = self.buffer.lock() {
             if buf.len() >= self.capacity {
@@ -201,5 +234,29 @@ mod tests {
         assert!(truncated.ends_with("... (truncated)"));
         // Must be valid UTF-8 (this would panic if not)
         let _ = truncated.chars().count();
+    }
+
+    #[test]
+    fn event_visitor_captures_structured_fields() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = new_log_buffer(10);
+        let layer = LogCaptureLayer::new(buf.clone(), 10);
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(id = 42, error = "search failed", "response error");
+        });
+
+        let guard = buf.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        let line = &guard[0];
+        assert!(line.contains("WARN"), "missing level: {line}");
+        assert!(line.contains("response error"), "missing message: {line}");
+        assert!(line.contains("id=42"), "missing id field: {line}");
+        assert!(
+            line.contains("search failed"),
+            "missing error field: {line}"
+        );
     }
 }
