@@ -97,6 +97,7 @@ pub struct SearchDocsRequest<'a> {
     pub query: String,
     pub filter_crates: Option<Vec<String>>,
     pub filter_kinds: Option<Vec<String>>,
+    pub filter_parent: Option<String>,
     pub mode: QueryMode,
     /// Maximum dependency depth to include (0 = workspace only, 1 = + direct deps, …).
     /// `None` means include all transitive dependencies.
@@ -1017,7 +1018,7 @@ impl AppState {
                 "cargo check failed",
                 "build_diagnostics",
                 true,
-                &["Run cargo check locally for complete output"],
+                &["Run cargo clippy locally for complete output"],
                 Some(project_path),
                 Some(message),
             );
@@ -1089,6 +1090,7 @@ impl AppState {
             query,
             filter_crates,
             filter_kinds,
+            filter_parent,
             mode,
             max_depth,
             limit,
@@ -1218,6 +1220,12 @@ impl AppState {
             }
         }
 
+        if let Some(parent) = filter_parent.as_ref() {
+            let idx = param_values.len() + 1;
+            extra_where.push_str(&format!(" AND d.parent_name = ?{idx}"));
+            param_values.push(Box::new(parent.clone()));
+        }
+
         // Fetch a bounded top-N window, then paginate in app code.
         let sql_limit = search_cap;
         let limit_param_idx = param_values.len() + 1;
@@ -1230,8 +1238,12 @@ impl AppState {
                 d.crate_version,
                 d.item_name,
                 d.kind,
-                snippet(docs_fts, 2, '<mark>', '</mark>', '...', 40) as text,
-                bm25(docs_fts, 1.0, 2.0, 1.0) as score
+                d.parent_name,
+                d.parent_kind,
+                d.trait_name,
+                d.signature,
+                snippet(docs_fts, 4, '<mark>', '</mark>', '...', 40) as text,
+                bm25(docs_fts, 1.0, 3.0, 2.0, 1.5, 1.0) as score
             FROM docs_fts
             JOIN docs d ON d.id = docs_fts.rowid
             WHERE docs_fts MATCH ?1
@@ -1254,16 +1266,36 @@ impl AppState {
                     let crate_version: String = row.get(1)?;
                     let item_name: String = row.get(2)?;
                     let kind: String = row.get(3)?;
-                    let text: String = row.get(4)?;
-                    let score: f64 = row.get(5)?;
-                    Ok(serde_json::json!({
+                    let parent_name: Option<String> = row.get(4)?;
+                    let parent_kind: Option<String> = row.get(5)?;
+                    let trait_name: Option<String> = row.get(6)?;
+                    let signature: String = row.get(7)?;
+                    let text: String = row.get(8)?;
+                    let score: f64 = row.get(9)?;
+                    let mut result = serde_json::json!({
                         "crate": crate_name,
                         "crate_version": crate_version,
                         "item": item_name,
                         "kind": kind,
-                        "text": text,
                         "score": -score,
-                    }))
+                    });
+                    let obj = result.as_object_mut().unwrap();
+                    if !signature.is_empty() {
+                        obj.insert("signature".into(), serde_json::json!(signature));
+                    }
+                    if let Some(p) = parent_name {
+                        obj.insert("parent".into(), serde_json::json!(p));
+                    }
+                    if let Some(pk) = parent_kind {
+                        obj.insert("parent_kind".into(), serde_json::json!(pk));
+                    }
+                    if let Some(t) = trait_name {
+                        obj.insert("trait".into(), serde_json::json!(t));
+                    }
+                    if !text.is_empty() {
+                        obj.insert("text".into(), serde_json::json!(text));
+                    }
+                    Ok(result)
                 })?;
                 Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             })
@@ -1445,6 +1477,8 @@ impl ServerHandler for AppState {
                 "Register projects, monitor index status, query docs, and fetch diagnostics. \
                  Use register_project once, reindex_project only when you want to refresh. \
                  Diagnostics are split by intent for small payloads. \
+                 search_docs indexes methods, variants, assoc types/consts with signatures and parent context. \
+                 Use the parent filter to find methods on a specific type (e.g. parent=\"HashMap\"). \
                  Resources: cratedex://logs. Prompt: coding_modern_rust."
                     .to_string(),
             ),
@@ -1581,6 +1615,12 @@ impl ServerHandler for AppState {
                                 .filter_map(|v| v.as_str().map(String::from))
                                 .collect::<Vec<String>>()
                         });
+                    let filter_parent = call
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("parent"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     let mode = QueryMode::parse(
                         call.arguments
                             .as_ref()
@@ -1608,6 +1648,7 @@ impl ServerHandler for AppState {
                         query,
                         filter_crates,
                         filter_kinds,
+                        filter_parent,
                         mode,
                         max_depth,
                         limit,
@@ -2040,10 +2081,14 @@ impl ServerHandler for AppState {
                                         },
                                         "description": "Optional kind filters"
                                     },
+                                    "parent": {
+                                        "type": "string",
+                                        "description": "Filter methods/variants by parent type name (e.g. \"HashMap\")"
+                                    },
                                     "mode": {
                                         "type": "string",
                                         "enum": ["auto", "text", "symbol", "fts5"],
-                                        "description": "Query parser mode. auto (default): detects symbol paths via ::. text/symbol: tokenize + prefix match. fts5: raw FTS5 query passed directly to SQLite MATCH. FTS5 columns: crate_name, item_name (2× BM25), text. Tokenizer: porter unicode61. Syntax: col : term, \"phrase\", OR, NOT, prefix*, NEAR(a b, N)."
+                                        "description": "Query parser mode. auto (default): detects symbol paths via ::. text/symbol: tokenize + prefix match. fts5: raw FTS5 query passed directly to SQLite MATCH. FTS5 columns: crate_name, item_name (3× BM25), parent_name (2×), signature (1.5×), text. Tokenizer: porter unicode61. Syntax: col : term, \"phrase\", OR, NOT, prefix*, NEAR(a b, N)."
                                     },
                                     "max_depth": {
                                         "type": ["integer", "null"],
@@ -2067,6 +2112,10 @@ impl ServerHandler for AppState {
                                     "crate_version": { "type": "string" },
                                     "item": { "type": "string" },
                                     "kind": { "type": "string" },
+                                    "signature": { "type": "string" },
+                                    "parent": { "type": "string" },
+                                    "parent_kind": { "type": "string" },
+                                    "trait": { "type": "string" },
                                     "text": { "type": "string" },
                                     "score": { "type": "number" }
                                 }
@@ -2455,7 +2504,7 @@ mod tests {
     use crate::engine::docs;
     use rusqlite::params;
 
-    const INSERT_SQL: &str = r#"INSERT INTO "docs" (crate_name, crate_version, package_id_hash, item_name, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#;
+    const INSERT_SQL: &str = r#"INSERT INTO "docs" (crate_name, crate_version, package_id_hash, item_name, kind, parent_name, parent_kind, trait_name, signature, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#;
 
     /// Helper: create an in-memory DB with docs table + FTS5.
     fn setup_db() -> Db {
@@ -2480,9 +2529,9 @@ mod tests {
         let mut progress = ProjectProgress::new();
 
         progress.merge_cargo_warnings(vec![
-            ("cargo check".into(), "warning: unused import".into()),
-            ("cargo check".into(), "warning: unused import".into()),
-            ("cargo check".into(), "error: type mismatch".into()),
+            ("cargo clippy".into(), "warning: unused import".into()),
+            ("cargo clippy".into(), "warning: unused import".into()),
+            ("cargo clippy".into(), "error: type mismatch".into()),
             // same message but different source — should NOT collapse
             ("cargo rustdoc".into(), "warning: unused import".into()),
         ]);
@@ -2492,7 +2541,7 @@ mod tests {
         let unused = progress
             .cargo_warnings
             .iter()
-            .find(|w| w.message == "warning: unused import" && w.source == "cargo check")
+            .find(|w| w.message == "warning: unused import" && w.source == "cargo clippy")
             .unwrap();
         assert_eq!(unused.count, 2);
     }
@@ -2567,7 +2616,10 @@ mod tests {
         let conn = db.conn.lock().unwrap();
         conn.execute(
             INSERT_SQL,
-            params![crate_name, version, pkg_hash, item_name, kind, text],
+            params![
+                crate_name, version, pkg_hash, item_name, kind,
+                None::<String>, None::<String>, None::<String>, "", text
+            ],
         )
         .unwrap();
     }
@@ -2603,6 +2655,7 @@ mod tests {
                 query: "task".to_string(),
                 filter_crates: None,
                 filter_kinds: None,
+                filter_parent: None,
                 mode: QueryMode::Auto,
                 max_depth: None,
                 limit: DEFAULT_PAGE_LIMIT,
@@ -2651,6 +2704,7 @@ mod tests {
                 query: "task".to_string(),
                 filter_crates: Some(vec!["serde".to_string()]),
                 filter_kinds: None,
+                filter_parent: None,
                 mode: QueryMode::Auto,
                 max_depth: None,
                 limit: DEFAULT_PAGE_LIMIT,
@@ -2693,6 +2747,7 @@ mod tests {
                 query: "stuff".to_string(),
                 filter_crates: None,
                 filter_kinds: None,
+                filter_parent: None,
                 mode: QueryMode::Auto,
                 max_depth: None,
                 limit: 50,
@@ -2711,6 +2766,7 @@ mod tests {
                 query: "stuff".to_string(),
                 filter_crates: None,
                 filter_kinds: None,
+                filter_parent: None,
                 mode: QueryMode::Auto,
                 max_depth: None,
                 limit: 50,
@@ -3075,6 +3131,7 @@ mod tests {
                 query: "stuff".to_string(),
                 filter_crates: None,
                 filter_kinds: None,
+                filter_parent: None,
                 mode: QueryMode::Auto,
                 max_depth: None,
                 limit: DEFAULT_PAGE_LIMIT,

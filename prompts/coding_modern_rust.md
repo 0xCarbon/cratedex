@@ -178,6 +178,265 @@ Only use the `async-trait` crate when you need `dyn Service` (dynamic dispatch).
 
 ---
 
+## Ownership & Borrowing
+
+### Function parameter guidelines
+
+| You need to… | Take | Example |
+|---|---|---|
+| Read the data | `&T` | `fn len(s: &str) -> usize` |
+| Mutate in place | `&mut T` | `fn push(v: &mut Vec<i32>, x: i32)` |
+| Take ownership (store, move, consume) | `T` | `fn spawn(f: impl FnOnce() + Send + 'static)` |
+| Accept multiple input types | `impl Into<T>` | `fn set_name(n: impl Into<String>)` |
+| Return owned data | `T` (not `&T`) | `fn create() -> Vec<u8>` |
+
+**Default to borrowing.** Only take ownership when you need to store,
+move into another thread, or the callee genuinely consumes the value.
+
+### Returning references — must borrow from an input
+
+A function can only return a reference if it borrows from a parameter
+(or from `&self` / `'static` data). Returning a reference to a local is
+always a compile error:
+
+```rust
+// BAD — s is owned, dropped at end of function
+fn first_word(s: String) -> &str {
+    &s[..s.find(' ').unwrap_or(s.len())]  // E0106/E0515
+}
+
+// GOOD — borrow from the caller's data
+fn first_word(s: &str) -> &str {
+    &s[..s.find(' ').unwrap_or(s.len())]
+}
+```
+
+### Shared ownership
+
+| Need | Use | Notes |
+|------|-----|-------|
+| Multiple owners, immutable | `Arc<T>` | Thread-safe; cheap clone |
+| Multiple owners, mutable | `Arc<Mutex<T>>` | Lock before access |
+| Borrow-or-own flexibility | `Cow<'a, T>` | Avoids allocation when borrowing suffices |
+
+Reach for `Arc` at async task boundaries. Prefer `Cow<str>` over
+`String` when a function sometimes borrows and sometimes allocates.
+
+---
+
+## Lifetimes
+
+### Core rule
+
+A reference `&'a T` promises the data lives at least as long as `'a`.
+The compiler infers lifetimes when possible (elision), but you must
+annotate when there's ambiguity.
+
+### Elision rules (quick reference)
+
+1. Each input reference gets its own lifetime.
+2. If there's exactly one input lifetime, output references get that
+   lifetime.
+3. If one input is `&self` or `&mut self`, output references get `self`'s
+   lifetime.
+
+When these rules don't resolve the output lifetime, you must annotate:
+
+```rust
+// Two input references — compiler can't guess which the output borrows from
+fn longer<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if a.len() >= b.len() { a } else { b }
+}
+```
+
+### Common pitfalls
+
+**Returning an iterator over owned data.** The iterator borrows the
+collection, but the collection is moved into the function — nothing to
+borrow from:
+
+```rust
+// BAD — s is consumed, iterator would dangle
+fn chars_of(s: String) -> impl Iterator<Item = char> {
+    s.chars()  // borrows s, but s is dropped → E0597
+}
+
+// GOOD — return an owned iterator
+fn chars_of(s: String) -> impl Iterator<Item = char> {
+    s.into_chars()  // ERROR: this method doesn't exist!
+    // Real fix: change the API to borrow, or collect
+}
+
+// Option A: borrow from the caller
+fn chars_of(s: &str) -> impl Iterator<Item = char> + '_ {
+    s.chars()
+}
+
+// Option B: return a Vec (allocates, but owned)
+fn chars_of(s: String) -> Vec<char> {
+    s.chars().collect()
+}
+```
+
+**Storing references in structs** — the struct's lifetime is tied to the
+reference source. Prefer owned data in structs unless the struct is
+explicitly short-lived:
+
+```rust
+// Fragile — ties Config's lifetime to the &str source
+struct Config<'a> { name: &'a str }
+
+// Simpler — no lifetime parameter
+struct Config { name: String }
+```
+
+**RPIT lifetime capture (Edition 2024)** — see Edition 2024 section above.
+In edition 2024, `impl Trait` captures all in-scope lifetimes by default.
+Use `+ use<'a>` to narrow capture when needed.
+
+---
+
+## Traits & Generics
+
+### Common derive sets
+
+```rust
+// Data types — derive liberally
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UserId(String);
+
+// Error types
+#[derive(Debug, thiserror::Error)]
+pub enum AppError { /* ... */ }
+
+// Config / serializable types
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config { /* ... */ }
+```
+
+Always derive `Debug`. Add `Clone`, `PartialEq`, `Eq`, `Hash` when the
+type will be used in collections or comparisons.
+
+### `impl Trait` vs generics vs `dyn Trait`
+
+| Approach | When to use | Trait objects? |
+|----------|-------------|---------------|
+| `fn foo(x: impl Trait)` | One concrete type, caller chooses | No (monomorphized) |
+| `fn foo<T: Trait>(x: T)` | Need `T` in multiple positions or `where` clause | No (monomorphized) |
+| `fn foo(x: &dyn Trait)` | Heterogeneous collection, plugin architecture | Yes (dynamic dispatch) |
+| `fn foo(x: Box<dyn Trait>)` | Owned trait object, returned from factory | Yes (heap-allocated) |
+
+**Prefer generics** (static dispatch) by default. Use `dyn Trait` only
+when you need type erasure (heterogeneous lists, reducing compile times
+in large codebases, or returning different concrete types).
+
+### Trait bounds — keep them readable
+
+```rust
+// Inline bounds — fine for 1-2 simple constraints
+fn serialize<T: Serialize + Debug>(val: &T) -> String { /* ... */ }
+
+// Where clauses — prefer for complex bounds
+fn process<T, E>(input: T) -> Result<T::Output, E>
+where
+    T: Transform + Send + 'static,
+    E: From<T::Error> + From<io::Error>,
+{
+    // ...
+}
+```
+
+### Supertraits
+
+```rust
+// Any Repository must also be Send + Sync (for use across async tasks)
+trait Repository: Send + Sync {
+    async fn get(&self, id: &str) -> Option<Record>;
+}
+```
+
+### Key marker traits
+
+| Trait | Meaning | When it matters |
+|-------|---------|-----------------|
+| `Send` | Safe to transfer across threads | `tokio::spawn`, `thread::spawn` |
+| `Sync` | Safe to reference from multiple threads | `Arc<T>` requires `T: Send + Sync` |
+| `'static` | Contains no non-static references | Task spawning, thread boundaries |
+| `Sized` | Size known at compile time | Default bound; opt out with `?Sized` |
+| `Unpin` | Can be moved after being pinned | Futures, `Pin<&mut T>` |
+
+---
+
+## Type Conversions
+
+### Infallible conversions — `From` / `Into`
+
+```rust
+// Implement From — you get Into for free
+impl From<UserId> for String {
+    fn from(id: UserId) -> Self { id.0 }
+}
+
+// Accept broad input via Into
+fn greet(name: impl Into<String>) {
+    let name = name.into();
+    println!("Hello, {name}");
+}
+greet("world");         // &str → String
+greet(String::new());   // String → String (no-op)
+```
+
+### Fallible conversions — `TryFrom` / `TryInto`
+
+```rust
+impl TryFrom<u64> for Port {
+    type Error = PortError;
+    fn try_from(n: u64) -> Result<Self, Self::Error> {
+        u16::try_from(n).ok()
+            .and_then(|p| (1..=65535).contains(&p).then_some(Port(p)))
+            .ok_or(PortError::OutOfRange(n))
+    }
+}
+```
+
+**Rule**: If the conversion can fail or lose data, use `TryFrom`, not
+`From`.
+
+### Cheap reference conversions — `AsRef` / `AsMut`
+
+```rust
+// Accept anything that can cheaply become a &Path
+fn read_config(path: impl AsRef<Path>) -> Result<Config> {
+    let text = std::fs::read_to_string(path.as_ref())?;
+    // ...
+}
+read_config("config.toml");           // &str → &Path
+read_config(PathBuf::from("/etc"));   // PathBuf → &Path
+```
+
+### String type cheat sheet
+
+| Type | Owned? | Use when |
+|------|--------|----------|
+| `&str` | No | Reading string data; function parameters |
+| `String` | Yes | Building, modifying, storing, returning |
+| `Cow<'a, str>` | Either | Conditionally allocating (parsing, formatting) |
+| `&[u8]` / `Vec<u8>` | No / Yes | Binary data, not guaranteed UTF-8 |
+
+```rust
+// Flexible function that avoids unnecessary allocation
+fn normalize(input: &str) -> Cow<'_, str> {
+    if input.contains('\t') {
+        Cow::Owned(input.replace('\t', "    "))
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+```
+
+---
+
 ## Error Handling
 
 ### Libraries — `thiserror` 2.0
@@ -428,6 +687,7 @@ rust-version = "1.85"
 unsafe_code = "forbid"
 
 [lints.clippy]
+# Lint groups — broad coverage
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
@@ -438,9 +698,60 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
+# Restriction lints — enforce quality patterns
+# Error handling: force ? or .expect("reason"), not .unwrap()
+unwrap_used = "warn"
+panic = "warn"
+unwrap_in_result = "warn"
+# Clarity: make intent explicit
+clone_on_ref_ptr = "warn"            # Arc::clone(&x) not x.clone()
+str_to_string = "warn"              # .to_owned() not .to_string() for &str
+string_to_string = "warn"           # catch meaningless String → String
+wildcard_enum_match_arm = "warn"    # match all variants, no catch-all _
+# Completeness: catch placeholders and debug leftovers
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 [profile.release]
 lto = "thin"
 strip = true
+```
+
+### `clippy.toml`
+
+Place at the project root alongside `Cargo.toml`:
+
+```toml
+msrv = "1.85"
+
+# Allow unwrap/expect in #[cfg(test)] — strict in production, relaxed in tests
+allow-unwrap-in-tests = true
+
+# Tighter thresholds than defaults
+too-many-arguments-threshold = 5     # default 7
+cognitive-complexity-threshold = 25   # default 25 (raise if needed)
+```
+
+### `rustfmt.toml`
+
+```toml
+edition = "2024"
+max_width = 100
+imports_granularity = "Module"       # group imports by module
+group_imports = "StdExternalCrate"   # separate std / external / crate imports
+```
+
+This produces clean import blocks:
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde::Serialize;
+use tokio::sync::Mutex;
+
+use crate::config::Settings;
 ```
 
 ### Workspace setup
@@ -448,10 +759,25 @@ strip = true
 ```toml
 [workspace]
 members = ["crates/*"]
-resolver = "3"       # edition 2024 default
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+unwrap_used = "warn"
+panic = "warn"
+unwrap_in_result = "warn"
+clone_on_ref_ptr = "warn"
+str_to_string = "warn"
+string_to_string = "warn"
+wildcard_enum_match_arm = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
 ```
 
 Each member inherits lints:

@@ -230,21 +230,43 @@ pub fn summarize_outdated(raw: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// Runs `cargo check` in the background and continuously updates the diagnostics cache.
+/// Probe whether `cargo clippy` is available on this system.
+async fn is_clippy_available(project_path: &Path) -> bool {
+    let mut cmd = new_cargo_command(project_path);
+    cmd.arg("clippy").arg("--version");
+    match run_with_timeout(&mut cmd, Duration::from_secs(10), "`cargo clippy --version`").await {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Runs `cargo clippy` (or `cargo check` as fallback) in the background and
+/// continuously updates the diagnostics cache.
 pub async fn run_check_on_startup(
     diagnostics_cache: Arc<Mutex<Vec<Value>>>,
     project_path: &Path,
     progress: Arc<Mutex<ProjectProgress>>,
 ) {
-    info!("Running initial `cargo check`...");
+    let use_clippy = is_clippy_available(project_path).await;
+    let tool_name = if use_clippy { "cargo clippy" } else { "cargo check" };
+    info!("Running initial `{tool_name}`...");
 
     let mut cmd = new_cargo_command(project_path);
-    cmd.arg("check").arg("--message-format=json");
+    if use_clippy {
+        cmd.arg("clippy")
+            .arg("--all-targets")
+            .arg("--message-format=json")
+            .arg("--")
+            .arg("-W")
+            .arg("clippy::all");
+    } else {
+        cmd.arg("check").arg("--message-format=json");
+    }
 
-    let output = match run_with_timeout(&mut cmd, CHECK_TIMEOUT, "`cargo check`").await {
+    let output = match run_with_timeout(&mut cmd, CHECK_TIMEOUT, &format!("`{tool_name}`")).await {
         Ok(output) => output,
         Err(e) => {
-            error!("Failed to execute `cargo check`: {}", e);
+            error!("Failed to execute `{tool_name}`: {}", e);
             let mut cache = diagnostics_cache.lock().await;
             cache.clear();
             cache.push(serde_json::json!({
@@ -254,7 +276,7 @@ pub async fn run_check_on_startup(
             return;
         }
     };
-    let cargo_warnings = extract_cargo_warnings(&output.stderr, "cargo check");
+    let cargo_warnings = extract_cargo_warnings(&output.stderr, tool_name);
     if !cargo_warnings.is_empty() {
         progress.lock().await.merge_cargo_warnings(cargo_warnings);
     }
@@ -266,7 +288,7 @@ pub async fn run_check_on_startup(
         .filter_map(parse_compiler_message_line)
         .collect();
     info!(
-        "Initial `cargo check` complete. Found {} diagnostics.",
+        "Initial `{tool_name}` complete. Found {} diagnostics.",
         cache.len()
     );
 }
@@ -540,5 +562,31 @@ mod tests {
 
         assert_eq!(results[1]["id"], "RUSTSEC-2002-0002");
         assert_eq!(results[1]["affected_count"], 1);
+    }
+
+    #[test]
+    fn clippy_lint_code_passes_through_summarization() {
+        // Clippy diagnostics use the same compiler-message format
+        let raw = vec![json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "warning",
+                "message": "this function could have a `#[must_use]` attribute",
+                "code": {"code": "clippy::must_use_candidate", "explanation": null},
+                "spans": [{
+                    "file_name": "src/lib.rs",
+                    "line_start": 10,
+                    "is_primary": true
+                }],
+                "children": [],
+                "rendered": "warning: this function...\n"
+            }
+        })];
+
+        let summary = summarize_diagnostics(&raw);
+        assert_eq!(summary.len(), 1);
+        let s = &summary[0];
+        assert_eq!(s["code"], "clippy::must_use_candidate");
+        assert_eq!(s["file"], "src/lib.rs");
     }
 }
