@@ -346,7 +346,12 @@ fn extract_pagination(
         .as_ref()
         .and_then(|a| a.get("limit"))
         .and_then(|v| v.as_u64())
-        .map(|v| usize::try_from(v).unwrap_or(usize::MAX).min(max_limit).max(1))
+        .map(|v| {
+            usize::try_from(v)
+                .unwrap_or(usize::MAX)
+                .min(max_limit)
+                .max(1)
+        })
         .unwrap_or(default_limit);
     let offset = args
         .as_ref()
@@ -2617,8 +2622,16 @@ mod tests {
         conn.execute(
             INSERT_SQL,
             params![
-                crate_name, version, pkg_hash, item_name, kind,
-                None::<String>, None::<String>, None::<String>, "", text
+                crate_name,
+                version,
+                pkg_hash,
+                item_name,
+                kind,
+                None::<String>,
+                None::<String>,
+                None::<String>,
+                "",
+                text
             ],
         )
         .unwrap();
@@ -3269,7 +3282,11 @@ mod tests {
         assert_eq!(q, "text : \"error handling\"");
 
         // Boolean OR
-        let q = build_fts_query("item_name : serialize OR item_name : deserialize", QueryMode::Fts5).unwrap();
+        let q = build_fts_query(
+            "item_name : serialize OR item_name : deserialize",
+            QueryMode::Fts5,
+        )
+        .unwrap();
         assert_eq!(q, "item_name : serialize OR item_name : deserialize");
 
         // Preserves :: and special chars (not tokenized)

@@ -234,7 +234,13 @@ pub fn summarize_outdated(raw: &Value) -> Vec<Value> {
 async fn is_clippy_available(project_path: &Path) -> bool {
     let mut cmd = new_cargo_command(project_path);
     cmd.arg("clippy").arg("--version");
-    match run_with_timeout(&mut cmd, Duration::from_secs(10), "`cargo clippy --version`").await {
+    match run_with_timeout(
+        &mut cmd,
+        Duration::from_secs(10),
+        "`cargo clippy --version`",
+    )
+    .await
+    {
         Ok(output) => output.status.success(),
         Err(_) => false,
     }
@@ -248,7 +254,11 @@ pub async fn run_check_on_startup(
     progress: Arc<Mutex<ProjectProgress>>,
 ) {
     let use_clippy = is_clippy_available(project_path).await;
-    let tool_name = if use_clippy { "cargo clippy" } else { "cargo check" };
+    let tool_name = if use_clippy {
+        "cargo clippy"
+    } else {
+        "cargo check"
+    };
     info!("Running initial `{tool_name}`...");
 
     let mut cmd = new_cargo_command(project_path);
