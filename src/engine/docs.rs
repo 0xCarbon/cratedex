@@ -1,12 +1,10 @@
 //! The documentation engine is responsible for generating and indexing docs.
 
 use crate::db::Db;
-use crate::engine::command::{
-    extract_cargo_warnings, new_nightly_cargo_command, run_with_timeout, stderr_preview,
-};
+use crate::engine::command::{extract_cargo_warnings, new_nightly_cargo_command, run_with_timeout};
 use crate::engine::server::ProjectProgress;
 use crate::error::{AppError, AppResult};
-use cargo_metadata::{Metadata, Node, Package, PackageId, camino::Utf8Path};
+use cargo_metadata::{Metadata, Node, Package, PackageId};
 use rusqlite::{Connection, params};
 use rustdoc_types::{
     Abi, AssocItemConstraint, AssocItemConstraintKind, Crate, DynTrait, FunctionPointer,
@@ -155,6 +153,7 @@ pub async fn ensure_docs_are_cached_and_indexed(
     let _enter = span.enter();
 
     let cache_dir = get_doc_cache_dir()?;
+    let rustdoc_target_dir = get_doc_rustdoc_target_dir(&project_path)?;
 
     // Ensure schema on startup
     db.call(|conn| {
@@ -175,8 +174,6 @@ pub async fn ensure_docs_are_cached_and_indexed(
         workspace_packages.len(),
         dep_packages.len()
     );
-
-    let target_dir = metadata.target_directory.clone();
 
     // Pipeline: Phase 1 produces (Package, PathBuf), Phase 2 consumes and indexes.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(Package, PathBuf)>(32);
@@ -207,7 +204,22 @@ pub async fn ensure_docs_are_cached_and_indexed(
                 }
             };
 
-            if already_indexed {
+            let should_idx = if already_indexed {
+                match should_index_package(&json_path, &pkg_hash) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "Failed to check index state for {} {}: {}",
+                            package.name, package.version, e
+                        );
+                        true
+                    }
+                }
+            } else {
+                true
+            };
+
+            if !should_idx {
                 debug!(
                     "docs: {} {} (already in global index)",
                     package.name, package.version
@@ -216,38 +228,22 @@ pub async fn ensure_docs_are_cached_and_indexed(
                 continue;
             }
 
-            let should_idx = match should_index_package(&json_path, &pkg_hash) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Failed to check meta for {} {}: {}",
-                        package.name, package.version, e
-                    );
-                    true
-                }
-            };
-
-            if should_idx {
-                let version = package.version.to_string();
-                if let Err(e) = index_rustdoc_json(&json_path, &db_p2, &version, &pkg_hash).await {
-                    warn!(
-                        "Failed to index {} {}: {}",
-                        package.name, package.version, e
-                    );
-                    continue;
-                }
-                if let Err(e) = write_doc_meta(&json_path, &package, &pkg_hash) {
-                    warn!(
-                        "Failed to write doc meta for {} {}: {}",
-                        package.name, package.version, e
-                    );
-                }
-                info!("docs: {} {} (indexed)", package.name, package.version);
-                indexed_count += 1;
-            } else {
-                debug!("docs: {} {} (up-to-date)", package.name, package.version);
-                indexed_count += 1;
+            let version = package.version.to_string();
+            if let Err(e) = index_rustdoc_json(&json_path, &db_p2, &version, &pkg_hash).await {
+                warn!(
+                    "Failed to index {} {}: {}",
+                    package.name, package.version, e
+                );
+                continue;
             }
+            if let Err(e) = write_doc_meta(&json_path, &package, &pkg_hash) {
+                warn!(
+                    "Failed to write doc meta for {} {}: {}",
+                    package.name, package.version, e
+                );
+            }
+            info!("docs: {} {} (indexed)", package.name, package.version);
+            indexed_count += 1;
         }
         indexed_count
     });
@@ -267,7 +263,7 @@ pub async fn ensure_docs_are_cached_and_indexed(
         if !cached_path.exists()
             && let Err(e) = generate_docs_for_package(
                 package,
-                target_dir.as_path(),
+                rustdoc_target_dir.as_path(),
                 &project_path,
                 Arc::clone(&progress),
                 RUSTDOC_WORKSPACE_TIMEOUT,
@@ -1489,7 +1485,7 @@ pub fn project_crate_scopes(metadata: &Metadata) -> AppResult<Vec<ProjectCrate>>
 
 async fn generate_docs_for_package(
     package: &Package,
-    target_dir: &Utf8Path,
+    target_dir: &Path,
     project_path: &Path,
     progress: Arc<Mutex<ProjectProgress>>,
     timeout: Duration,
@@ -1503,6 +1499,8 @@ async fn generate_docs_for_package(
     cmd.arg("rustdoc")
         .arg("--package")
         .arg(package_spec)
+        .arg("--target-dir")
+        .arg(target_dir)
         .arg("--")
         .arg("-Z")
         .arg("unstable-options")
@@ -1516,11 +1514,12 @@ async fn generate_docs_for_package(
     }
 
     if !output.status.success() {
+        let reason = extract_generation_error_reason(&output.stderr);
         return Err(anyhow::anyhow!(
             "`cargo rustdoc` failed for {} {}: {}",
             package.name,
             package.version,
-            stderr_preview(&output.stderr, 5)
+            reason
         )
         .into());
     }
@@ -1535,7 +1534,7 @@ async fn generate_docs_for_package(
             "`cargo rustdoc` succeeded for {} {}, but JSON was not found at {}",
             package.name,
             package.version,
-            source_path
+            source_path.display()
         )
         .into());
     }
@@ -1550,6 +1549,33 @@ async fn generate_docs_for_package(
         package.name, package.version
     );
     Ok(())
+}
+
+// TODO: add a gc/cleanup command — each registered project gets a persistent
+// rustdoc target directory that accumulates build artifacts over time.
+fn get_doc_rustdoc_target_dir(project_path: &Path) -> AppResult<PathBuf> {
+    let mut hasher = Sha256::new();
+    hasher.update(project_path.to_string_lossy().as_bytes());
+
+    let mut dir_name = String::with_capacity(64);
+    for b in hasher.finalize() {
+        let _ = write!(dir_name, "{b:02x}");
+    }
+
+    let dir = get_cache_dir()?.join("rustdoc-target").join(dir_name);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn extract_generation_error_reason(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    text.lines()
+        .rev()
+        .find(|line| line.trim().starts_with("error:"))
+        .or_else(|| text.lines().rev().find(|line| !line.trim().is_empty()))
+        .unwrap_or("unknown generation failure")
+        .trim()
+        .to_string()
 }
 
 /// Gets the path to the main cache directory.
@@ -1981,6 +2007,45 @@ mod tests {
         assert_eq!(results[0].0, "spawn");
         assert!(results[0].1.contains("JoinHandle"));
         Ok(())
+    }
+
+    // ───── extract_generation_error_reason tests ─────
+
+    #[test]
+    fn error_reason_finds_last_error_line() {
+        let stderr =
+            b"   Compiling foo v0.1.0\n   Checking bar v0.2.0\nerror: could not compile `foo`";
+        assert_eq!(
+            extract_generation_error_reason(stderr),
+            "error: could not compile `foo`"
+        );
+    }
+
+    #[test]
+    fn error_reason_prefers_summary_over_error_code() {
+        let stderr = b"error[E0277]: the trait `Send` is not implemented\nerror: could not compile `foo` due to 1 previous error";
+        assert_eq!(
+            extract_generation_error_reason(stderr),
+            "error: could not compile `foo` due to 1 previous error"
+        );
+    }
+
+    #[test]
+    fn error_reason_falls_back_to_last_nonempty_line() {
+        let stderr =
+            b"   Checking lance v0.38.2\n   Blocking waiting for file lock on package cache\n";
+        assert_eq!(
+            extract_generation_error_reason(stderr),
+            "Blocking waiting for file lock on package cache"
+        );
+    }
+
+    #[test]
+    fn error_reason_handles_empty_stderr() {
+        assert_eq!(
+            extract_generation_error_reason(b""),
+            "unknown generation failure"
+        );
     }
 
     // ───── Type renderer unit tests ─────
