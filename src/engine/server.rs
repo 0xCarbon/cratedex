@@ -43,11 +43,13 @@ const MAX_PAGE_LIMIT: usize = 200;
 const DEFAULT_DETAIL_LIMIT: usize = 20;
 const MAX_DETAIL_LIMIT: usize = 100;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryMode {
     Auto,
     Text,
     Symbol,
+    /// Raw FTS5 query passed directly to SQLite MATCH without transformation.
+    Fts5,
 }
 
 impl QueryMode {
@@ -56,12 +58,13 @@ impl QueryMode {
             "auto" => Ok(Self::Auto),
             "text" => Ok(Self::Text),
             "symbol" => Ok(Self::Symbol),
+            "fts5" => Ok(Self::Fts5),
             other => Err(invalid_tool_error(
                 "INVALID_QUERY_MODE",
                 &format!("invalid query mode '{other}'"),
                 "search_docs",
                 false,
-                &["Use one of: auto, text, symbol"],
+                &["Use one of: auto, text, symbol, fts5"],
                 None,
                 None,
             )),
@@ -392,6 +395,11 @@ fn build_fts_query(query: &str, mode: QueryMode) -> Result<String, McpError> {
         ));
     }
 
+    // Raw FTS5 mode: pass query directly to MATCH without transformation.
+    if mode == QueryMode::Fts5 {
+        return Ok(query.to_string());
+    }
+
     let resolved = match mode {
         QueryMode::Auto if query.contains("::") => QueryMode::Symbol,
         QueryMode::Auto => QueryMode::Text,
@@ -400,7 +408,7 @@ fn build_fts_query(query: &str, mode: QueryMode) -> Result<String, McpError> {
 
     let tokens = match resolved {
         QueryMode::Text | QueryMode::Symbol => search_tokens(query),
-        QueryMode::Auto => unreachable!("auto mode is resolved above"),
+        QueryMode::Auto | QueryMode::Fts5 => unreachable!("resolved above"),
     };
     if tokens.is_empty() {
         return Err(invalid_tool_error(
@@ -1273,7 +1281,10 @@ impl AppState {
                         "search query could not be parsed",
                         "search_docs",
                         false,
-                        &["Use words or symbol paths like tokio::spawn"],
+                        &[
+                            "Use words or symbol paths like tokio::spawn",
+                            "For fts5 mode: check FTS5 syntax (col : term, \"phrase\", OR, NOT)",
+                        ],
                         project_path,
                         Some(&err_text),
                     ));
@@ -2031,8 +2042,8 @@ impl ServerHandler for AppState {
                                     },
                                     "mode": {
                                         "type": "string",
-                                        "enum": ["auto", "text", "symbol"],
-                                        "description": "Query parser mode"
+                                        "enum": ["auto", "text", "symbol", "fts5"],
+                                        "description": "Query parser mode. auto (default): detects symbol paths via ::. text/symbol: tokenize + prefix match. fts5: raw FTS5 query passed directly to SQLite MATCH. FTS5 columns: crate_name, item_name (2× BM25), text. Tokenizer: porter unicode61. Syntax: col : term, \"phrase\", OR, NOT, prefix*, NEAR(a b, N)."
                                     },
                                     "max_depth": {
                                         "type": ["integer", "null"],
@@ -3186,5 +3197,26 @@ mod tests {
     fn build_fts_query_rejects_unsearchable_input() {
         assert!(build_fts_query("", QueryMode::Auto).is_err());
         assert!(build_fts_query(":: ::", QueryMode::Auto).is_err());
+        // fts5 mode also rejects empty queries
+        assert!(build_fts_query("", QueryMode::Fts5).is_err());
+    }
+
+    #[test]
+    fn build_fts_query_fts5_mode_passes_through_raw_query() {
+        // Column filter
+        let q = build_fts_query("item_name : spawn", QueryMode::Fts5).unwrap();
+        assert_eq!(q, "item_name : spawn");
+
+        // Phrase match
+        let q = build_fts_query("text : \"error handling\"", QueryMode::Fts5).unwrap();
+        assert_eq!(q, "text : \"error handling\"");
+
+        // Boolean OR
+        let q = build_fts_query("item_name : serialize OR item_name : deserialize", QueryMode::Fts5).unwrap();
+        assert_eq!(q, "item_name : serialize OR item_name : deserialize");
+
+        // Preserves :: and special chars (not tokenized)
+        let q = build_fts_query(":: ::", QueryMode::Fts5).unwrap();
+        assert_eq!(q, ":: ::");
     }
 }
